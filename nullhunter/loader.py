@@ -1,14 +1,10 @@
 import os
 import csv
 import warnings
+import psutil
 import pandas as pd
 
 class DataLoader:
-    """
-    NullHunter's Enterprise-Grade Data Ingestion Module (The File Sniffer).
-    Dynamically handles encoding crashes, delimiter illusions, metadata traps,
-    and memory fragmentation before the data even touches the RAM.
-    """
     def __init__(self, 
                  filepath, 
                  chunk_size=100000, 
@@ -20,7 +16,6 @@ class DataLoader:
                  detect_metadata_headers=True,
                  cache_in_memory=False):
         
-        # 1. Parameter Assignment
         self.filepath = filepath
         self.chunk_size = chunk_size
         self.fault_tolerance = fault_tolerance
@@ -28,28 +23,63 @@ class DataLoader:
         self.sniff_bytes = sniff_bytes
         self.detect_metadata_headers = detect_metadata_headers
         self.cache_in_memory = cache_in_memory
-
-        # New: Internal RAM Cache Storage
-        self._cached_chunks = []
         
-        # 2. Smart Defaults for Core Edge Cases
-        # List of encodings to try before giving up (Edge Case 1)
+        self._cached_chunks = [] 
+        
         self.encodings = fallback_encodings or ['utf-8', 'latin-1', 'iso-8859-1', 'cp1252', 'unicode_escape']
-        # List of potential delimiters to sniff (Edge Case 3)
         self.delimiters = possible_delimiters or [',', ';', '\t', '|']
         
-        # 3. The Safe Configuration Dictionary
-        # This will be dynamically populated by the Sniffer before loading data
         self.safe_config = {
             'encoding': None,
             'delimiter': None,
             'skiprows': 0,
-            'engine': 'c'  # Default pandas C-engine for speed
+            'engine': 'c'
         }
         
-        # 4. Trigger the Pre-Load Sniffing Protocol immediately
+        # 1. First validate the file exists
         self._validate_file()
+        
+        # 2. NEW: Check if caching is mathematically safe before sniffing
+        if self.cache_in_memory:
+            self._check_ram_safety()
+            
+        # 3. Proceed with standard sniffing
         self._sniff_and_configure()
+
+    def _check_ram_safety(self):
+        """
+        Calculates the physical file size and compares it against the system's 
+        available RAM to prevent catastrophic Out-Of-Memory (OOM) crashes.
+        Pandas DataFrames typically consume 2x to 3x the raw CSV size in memory.
+        """
+        # Get actual file size in bytes and convert to Gigabytes
+        file_size_bytes = os.path.getsize(self.filepath)
+        file_size_gb = file_size_bytes / (1024 ** 3)
+        
+        # Get live available system RAM in Gigabytes
+        available_ram_bytes = psutil.virtual_memory().available
+        available_ram_gb = available_ram_bytes / (1024 ** 3)
+        
+        # Heuristic: We need at least 3x the file size in free RAM to safely cache it
+        required_ram_gb = file_size_gb * 3.0
+        
+        print(f"[NullHunter Safety] Checking Memory Limits...")
+        print(f"|-- File Size: {file_size_gb:.2f} GB")
+        print(f"|-- Available RAM: {available_ram_gb:.2f} GB")
+        print(f"|-- Estimated RAM Required: {required_ram_gb:.2f} GB")
+        
+        # If the required RAM is greater than 80% of our available RAM, we override the user!
+        if required_ram_gb > (available_ram_gb * 0.8):
+            warnings.warn(
+                f"\n[NullHunter ALARM] Critical Memory Risk Detected!\n"
+                f"Caching {file_size_gb:.2f}GB dataset requires ~{required_ram_gb:.2f}GB RAM.\n"
+                f"You only have {available_ram_gb:.2f}GB available.\n"
+                f"System is overriding user command. Forcing 'cache_in_memory=False' to prevent OS crash."
+            )
+            # OVERRIDE THE DANGER
+            self.cache_in_memory = False
+        else:
+            print("[NullHunter Safety] Memory check passed. RAM Caching is SAFE to proceed.")
 
     def _validate_file(self):
         """Checks if file exists and handles Format Mismatch Warnings (Edge Case 4)."""
