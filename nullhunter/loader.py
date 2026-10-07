@@ -28,21 +28,24 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
+# ==========================================
+# CLASS DATALOADER
+# ==========================================
 class DataLoader:
     """
     Enterprise-Grade Data Ingestion Engine for Project NullHunter.
     
     This module acts as the entry point for all raw datasets. It automatically
     detects file formats, sniffs delimiters and encodings for text files, 
-    evaluates RAM safety to prevent OOM (Out-Of-Memory) crashes, and streams 
-    data into chunks for out-of-core processing.
+    evaluates RAM safety to prevent OOM (Out-Of-Memory) crashes, and implements 
+    smart routing (Fast Path for small files vs. Chunk Path for massive out-of-core data).
 
     Attributes:
         filepath (Path): Absolute or relative path to the dataset.
         chunk_size (int): Number of rows to read per iteration (for supported formats).
         memory_backend (str): Pandas backend to use ('pyarrow' is highly recommended for RAM efficiency).
         cache_in_memory (bool): If True, retains all chunks in RAM for instant re-access.
+        fast_path_threshold (float): Percentage of available RAM below which a file is loaded entirely (default: 0.15).
     """
 
     def __init__(
@@ -57,7 +60,20 @@ class DataLoader:
         detect_metadata_headers: bool = True,
         cache_in_memory: bool = False
     ) -> None:
-        """Initializes the DataLoader with configuration and safety constraints."""
+        """
+        Initializes the DataLoader with configuration and safety constraints.
+        
+        Args:
+            filepath (Union[str, Path]): Path to the input data file.
+            chunk_size (int): Row count per chunk for out-of-core processing.
+            fallback_encodings (Optional[List[str]]): List of encodings to try during sniffing.
+            possible_delimiters (Optional[List[str]]): List of delimiters to test.
+            fault_tolerance (str): Strategy for bad lines ('skip', 'error', etc.).
+            memory_backend (str): DataFrame backend ('pyarrow' or 'numpy_nullable').
+            sniff_bytes (int): Number of bytes to read for metadata detection.
+            detect_metadata_headers (bool): Whether to auto-skip junk corporate headers.
+            cache_in_memory (bool): If True, saves all chunks to RAM (if safe).
+        """
         
         self.filepath = Path(filepath)
         self.chunk_size = chunk_size
@@ -67,12 +83,14 @@ class DataLoader:
         self.detect_metadata_headers = detect_metadata_headers
         self.cache_in_memory = cache_in_memory
 
+        # Internal state and buffers
         self._cached_chunks: List[pd.DataFrame] = []
+        self._fast_path: bool = False
+        self.fast_path_threshold: float = 0.15  # Bypass chunking if required RAM < 15% of free RAM
         
         self.encodings = fallback_encodings or ['utf-8', 'latin-1', 'iso-8859-1', 'cp1252', 'unicode_escape']
         self.delimiters = possible_delimiters or [',', ';', '\t', '|']
         
-        # State configuration for text-based files
         self.safe_config: Dict[str, Any] = {
             'encoding': 'utf-8',
             'delimiter': ',',
@@ -84,11 +102,12 @@ class DataLoader:
         self._file_extension = self.filepath.suffix.lower()
         self._is_text_based = self._file_extension in ['.csv', '.tsv', '.txt']
         
+        # Initialization Pipeline
         self._validate_file()
         self._detect_compression()
         
-        if self.cache_in_memory or not self._is_text_based:
-            self._check_ram_safety()
+        # Always run RAM safety check to determine Fast Path vs Chunk Path
+        self._check_ram_safety()
 
         if self._is_text_based:
             self._sniff_and_configure_text()
@@ -111,7 +130,7 @@ class DataLoader:
         """Detects if the CSV/TXT file is compressed to handle sniffing properly."""
         if self._file_extension == '.gz':
             self.safe_config['compression'] = 'gzip'
-            self._is_text_based = True # Assuming it's a zipped csv
+            self._is_text_based = True
             logger.info("Detected GZIP compression.")
         elif self._file_extension == '.zip':
             self.safe_config['compression'] = 'zip'
@@ -121,8 +140,8 @@ class DataLoader:
 
     def _check_ram_safety(self) -> None:
         """
-        Calculates physical file size and compares it against system's available RAM.
-        Applies dynamic heuristics based on the file format (Excel bloats more than CSV).
+        Evaluates physical file size against available RAM to set ingestion paths.
+        Activates Fast Path for small files and applies safety stops for massive files.
         
         Raises:
             NullHunterMemoryError: If caching is forced and RAM is vastly insufficient.
@@ -133,24 +152,33 @@ class DataLoader:
         available_ram_bytes = psutil.virtual_memory().available
         available_ram_gb = available_ram_bytes / (1024 ** 3)
         
-        # Heuristics: Excel uses ~6x its size in RAM. CSV uses ~3x.
+        # Excel inflates massively; CSV inflates moderately.
         multiplier = 6.0 if self._file_extension in ['.xlsx', '.xls'] else 3.0
         required_ram_gb = file_size_gb * multiplier
         
         logger.info(f"RAM Check -> File: {file_size_gb:.3f}GB | Required: ~{required_ram_gb:.2f}GB | Available: {available_ram_gb:.2f}GB")
         
+        # 1. Extreme Danger (OOM Risk)
         if required_ram_gb > (available_ram_gb * 0.85):
             if self._file_extension in ['.xlsx', '.xls']:
-                # Excel cannot be chunked easily. If it doesn't fit, we must crash early.
                 raise NullHunterMemoryError(
                     f"Out of Memory Risk: Loading this Excel file requires ~{required_ram_gb:.2f}GB RAM, "
-                    f"but only {available_ram_gb:.2f}GB is available. Consider converting to CSV."
+                    f"but only {available_ram_gb:.2f}GB is available."
                 )
             else:
-                logger.warning("Critical Memory Risk! Overriding user cache command to prevent OS crash.")
+                logger.warning("Critical Memory Risk! Forcing Chunk Path and disabling memory caching.")
                 self.cache_in_memory = False
+                self._fast_path = False
+                
+        # 2. Fast Path (Abundant RAM / Small File)
+        elif required_ram_gb < (available_ram_gb * self.fast_path_threshold):
+            logger.info("Small dataset detected relative to RAM. Activating FAST PATH (Disk I/O Bypass).")
+            self._fast_path = True
+            
+        # 3. Standard Path (Chunking required)
         else:
-            logger.info("RAM Check Passed. Caching / Bulk Loading is safe.")
+            logger.info("RAM Check Passed. Using standard Chunk Path for safe out-of-core ingestion.")
+            self._fast_path = False
 
 
     def _read_raw_bytes(self) -> bytes:
@@ -166,7 +194,6 @@ class DataLoader:
                     return f.read(self.sniff_bytes)
             elif self.safe_config['compression'] == 'zip':
                 with zipfile.ZipFile(self.filepath, 'r') as z:
-                    # Sniff the first file in the zip archive
                     first_file = z.namelist()[0]
                     with z.open(first_file, 'r') as f:
                         return f.read(self.sniff_bytes)
@@ -179,7 +206,7 @@ class DataLoader:
 
 
     def _sniff_and_configure_text(self) -> None:
-        """Master X-Ray function for text files (CSV, TSV). Detects encoding, delimiter, and headers."""
+        """Master X-Ray function for text files. Detects encoding, delimiter, and headers."""
         raw_bytes = self._read_raw_bytes()
         if not raw_bytes:
             return
@@ -253,12 +280,11 @@ class DataLoader:
     def get_chunks(self) -> Iterator[pd.DataFrame]:
         """
         The Master Generator Engine. 
-        Routes data reading based on file format and yields DataFrames.
+        Routes data reading based on file format, memory profile, and bypass flags.
         
         Yields:
-            Iterator[pd.DataFrame]: Data chunks for processing.
+            Iterator[pd.DataFrame]: Data chunks (or full dataframe if Fast Path is active).
         """
-        # Cache Interceptor
         if self.cache_in_memory and self._cached_chunks:
             logger.info("Serving chunks directly from Ultra-Fast RAM Cache...")
             for chunk in self._cached_chunks:
@@ -284,33 +310,48 @@ class DataLoader:
 
 
     def _stream_csv(self) -> Iterator[pd.DataFrame]:
-        """Internal generator for streaming text-based files."""
-        chunk_iterator = pd.read_csv(
-            self.filepath,
-            chunksize=self.chunk_size,
-            encoding=self.safe_config['encoding'],
-            delimiter=self.safe_config['delimiter'],
-            skiprows=self.safe_config['skiprows'],
-            on_bad_lines=self.fault_tolerance,
-            engine=self.safe_config['engine'],
-            dtype_backend=self.memory_backend,
-            compression=self.safe_config['compression'],
-            low_memory=False
-        )
-        
-        for chunk_id, chunk in enumerate(chunk_iterator, start=1):
-            logger.debug(f"Yielding Text Chunk {chunk_id} to the Scanner...")
+        """Generates chunks for text files, honoring the Fast Path bypass."""
+        if self._fast_path:
+            logger.info("[Fast Path] Bypassing chunking. Loading entire CSV into memory.")
+            df = pd.read_csv(
+                self.filepath,
+                encoding=self.safe_config['encoding'],
+                delimiter=self.safe_config['delimiter'],
+                skiprows=self.safe_config['skiprows'],
+                on_bad_lines=self.fault_tolerance,
+                engine=self.safe_config['engine'],
+                dtype_backend=self.memory_backend,
+                compression=self.safe_config['compression'],
+                low_memory=False
+            )
             if self.cache_in_memory:
-                self._cached_chunks.append(chunk)
-            yield chunk
+                self._cached_chunks.append(df)
+            yield df
+        else:
+            logger.info("[Chunk Path] Streaming CSV from disk sequentially.")
+            chunk_iterator = pd.read_csv(
+                self.filepath,
+                chunksize=self.chunk_size,
+                encoding=self.safe_config['encoding'],
+                delimiter=self.safe_config['delimiter'],
+                skiprows=self.safe_config['skiprows'],
+                on_bad_lines=self.fault_tolerance,
+                engine=self.safe_config['engine'],
+                dtype_backend=self.memory_backend,
+                compression=self.safe_config['compression'],
+                low_memory=False
+            )
+            
+            for chunk_id, chunk in enumerate(chunk_iterator, start=1):
+                logger.debug(f"Yielding Text Chunk {chunk_id} to the Scanner...")
+                if self.cache_in_memory:
+                    self._cached_chunks.append(chunk)
+                yield chunk
 
 
     def _stream_excel(self) -> Iterator[pd.DataFrame]:
-        """
-        Internal generator for Excel files. 
-        Note: Pandas cannot chunk Excel files easily, so it is loaded wholly.
-        """
-        logger.warning("Excel format detected. Chunking is disabled; loading entire file into memory.")
+        """Excel files do not support chunking well. Loaded wholly."""
+        logger.info("[Fast Path] Excel format detected. Loading entire file into memory.")
         df = pd.read_excel(
             self.filepath,
             dtype_backend=self.memory_backend
@@ -321,9 +362,8 @@ class DataLoader:
 
 
     def _stream_parquet(self) -> Iterator[pd.DataFrame]:
-        """Internal generator for Parquet files (Highly Optimized)."""
-        logger.info("Parquet format detected. Loading optimized binary matrix.")
-        # Parquet natively supports row groups, but for simplicity we load full or use pyarrow dataset iterators
+        """Parquet files are natively optimized and loaded directly."""
+        logger.info("[Fast Path] Parquet format detected. Loading optimized binary matrix.")
         df = pd.read_parquet(
             self.filepath,
             dtype_backend=self.memory_backend
@@ -334,25 +374,30 @@ class DataLoader:
 
 
     def _stream_json(self) -> Iterator[pd.DataFrame]:
-        """Internal generator for JSON files. Attempts lines=True streaming first."""
-        logger.info("JSON format detected. Attempting to load...")
-        try:
-            # Try chunked streaming for JSON-lines
-            chunk_iterator = pd.read_json(
-                self.filepath, 
-                orient='records', 
-                lines=True, 
-                chunksize=self.chunk_size,
-                dtype_backend=self.memory_backend
-            )
-            for chunk in chunk_iterator:
-                if self.cache_in_memory:
-                    self._cached_chunks.append(chunk)
-                yield chunk
-        except Exception:
-            # Fallback to loading whole JSON if it's a monolithic block
-            logger.warning("JSON streaming failed. Loading monolithic JSON block.")
+        """Generates chunks for JSON files, honoring the Fast Path bypass."""
+        if self._fast_path:
+            logger.info("[Fast Path] Bypassing chunking. Loading entire JSON into memory.")
             df = pd.read_json(self.filepath, dtype_backend=self.memory_backend)
             if self.cache_in_memory:
                 self._cached_chunks.append(df)
             yield df
+        else:
+            logger.info("[Chunk Path] Attempting JSON lines streaming.")
+            try:
+                chunk_iterator = pd.read_json(
+                    self.filepath, 
+                    orient='records', 
+                    lines=True, 
+                    chunksize=self.chunk_size,
+                    dtype_backend=self.memory_backend
+                )
+                for chunk in chunk_iterator:
+                    if self.cache_in_memory:
+                        self._cached_chunks.append(chunk)
+                    yield chunk
+            except Exception:
+                logger.warning("JSON streaming failed. Falling back to monolithic load.")
+                df = pd.read_json(self.filepath, dtype_backend=self.memory_backend)
+                if self.cache_in_memory:
+                    self._cached_chunks.append(df)
+                yield df
