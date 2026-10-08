@@ -1,39 +1,36 @@
-import os
 import logging
 import math
 import numpy as np
 import pandas as pd
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import Dict, Any, List, Optional, Union, Set, Tuple
+from typing import Dict, Any, List, Optional
 
 # ==========================================
 # LOGGER CONFIGURATION
 # ==========================================
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s | [%(levelname)s] NULLHUNTER_SCANNER: %(message)s',
+    format='%(asctime)s | [%(levelname)s] NULLHUNTER_BRAIN: %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
 
 # ==========================================
-# ISOLATED MAP-WORKER (For Multiprocessing)
+# ISOLATED MAP-WORKER (Micro-API)
 # ==========================================
-# Placed outside the class to ensure perfect Pickling for ProcessPoolExecutor.
-def _map_chunk_stats(chunk: pd.DataFrame, target_columns: Optional[List[str]]) -> Dict[str, Dict[str, Any]]:
+def extract_chunk_statistics(chunk: pd.DataFrame, target_columns: Optional[List[str]] = None) -> Dict[str, Dict[str, Any]]:
     """
-    The Isolated Map Worker (Phase 1 of MapReduce).
+    The Pure Stateless Map Worker (Phase 1 of MapReduce).
     
-    Extracts raw mathematical moments and frequency counts from a single chunk.
-    It returns only tiny numerical scalars, dropping the heavy DataFrame immediately 
-    to preserve RAM across parallel CPU cores.
+    Extracts raw mathematical moments, frequency counts, and text metadata from a single chunk.
+    This function is completely decoupled from any multiprocessing logic, making it 100% 
+    pickle-safe and universally runnable by any external engine (e.g., ParallelRunner).
     
     Args:
-        chunk (pd.DataFrame): A 2D slice of the dataset.
-        target_columns (Optional[List[str]]): Specific columns to profile.
+        chunk (pd.DataFrame): A 2D flat slice of the dataset.
+        target_columns (Optional[List[str]]): Specific columns to profile. If None, profiles all.
         
     Returns:
-        Dict: Raw chunk statistics mapped by column name.
+        Dict[str, Dict[str, Any]]: Raw chunk statistics mapped by column name.
     """
     chunk_stats: Dict[str, Dict[str, Any]] = {}
     cols_to_scan = target_columns if target_columns else chunk.columns
@@ -50,6 +47,7 @@ def _map_chunk_stats(chunk: pd.DataFrame, target_columns: Optional[List[str]]) -
         
         is_numeric = pd.api.types.is_numeric_dtype(series)
         
+        # Base state dictionary
         stats: Dict[str, Any] = {
             "total_rows": total_rows,
             "missing_count": missing_count,
@@ -58,30 +56,44 @@ def _map_chunk_stats(chunk: pd.DataFrame, target_columns: Optional[List[str]]) -
             "sum_x": 0.0,
             "sum_x2": 0.0,
             "sum_x3": 0.0,
+            "sum_x4": 0.0,  # Required for Kurtosis calculation
+            "zero_count": 0,
+            "negative_count": 0,
             "min": float('inf'),
             "max": float('-inf'),
-            "unique_sample": set()
+            "unique_sample": set(),
+            "sum_text_len": 0,
+            "max_text_len": 0
         }
 
         if valid_count > 0:
             if is_numeric:
-                # Core mathematical moments for Variance, Skewness, and Outliers
+                # Core mathematical moments for Mean, Variance, Skewness, and Kurtosis
                 stats["sum_x"] = float(np.sum(valid_data))
                 stats["sum_x2"] = float(np.sum(valid_data ** 2))
                 stats["sum_x3"] = float(np.sum(valid_data ** 3))
+                stats["sum_x4"] = float(np.sum(valid_data ** 4))
+                
                 stats["min"] = float(np.min(valid_data))
                 stats["max"] = float(np.max(valid_data))
+                stats["zero_count"] = int((valid_data == 0).sum())
+                stats["negative_count"] = int((valid_data < 0).sum())
                 
                 # Integer checking for Predictive Mean Matching (PMM)
                 stats["is_discrete"] = bool(np.all(np.mod(valid_data, 1) == 0))
             else:
-                # Capture a capped set of unique values to prevent RAM explosion on high cardinality
-                # We cap at 50,000 per chunk. The Reducer will union them.
+                # Capture text length metrics for NLP Detection
+                text_data = valid_data.astype(str)
+                text_lengths = text_data.str.len()
+                stats["sum_text_len"] = int(text_lengths.sum())
+                stats["max_text_len"] = int(text_lengths.max())
+
+                # Capture a capped set of unique values to prevent RAM explosion
                 unique_vals = valid_data.unique()
-                if len(unique_vals) <= 50000:
+                if len(unique_vals) <= 25000:
                     stats["unique_sample"] = set(unique_vals)
                 else:
-                    stats["unique_sample"] = set(unique_vals[:50000])
+                    stats["unique_sample"] = set(unique_vals[:25000])
                     stats["high_cardinality_flag"] = True
 
         chunk_stats[col] = stats
@@ -90,87 +102,99 @@ def _map_chunk_stats(chunk: pd.DataFrame, target_columns: Optional[List[str]]) -
 
 
 # ==========================================
-# THE MASTER SCANNER CLASS
+# THE SCANNER CLASS (The Brain)
 # ==========================================
 class DataScanner:
     """
     The Autonomous Statistical Profiler & AI Blueprint Generator for NullHunter.
     
-    Implements a strict Separation of Concerns. It uses streaming mathematics
-    (MapReduce) to calculate global properties of out-of-core datasets. It does NOT 
-    modify data; it acts as a diagnostic physician, writing a 'prescription' (Blueprint) 
-    utilizing industry-standard and cutting-edge imputation algorithms.
+    This module strictly adheres to the Single Responsibility Principle (SRP). 
+    It manages NO CPU cores and NO execution pipelines. It acts solely as the 
+    'Diagnostic Physician'—reducing mapped stats and generating a deterministic JSON Blueprint.
     """
 
     def __init__(
         self,
-        target_columns: Optional[List[str]] = None,
-        max_cores: Optional[int] = None,
-        # Thresholds (The Knobs & Dials of the AI)
+        # Sparsity & Core Thresholds
         drop_threshold: float = 0.85,
         constant_variance_drop: bool = True,
+        
+        # Distribution & Outlier Thresholds
         skewness_high_threshold: float = 1.5,
         skewness_extreme_threshold: float = 3.0,
+        kurtosis_threshold: float = 3.0,
         outlier_z_threshold: float = 3.5,
+        zero_inflation_trigger: float = 0.30,
+        
+        # Advanced ML Algorithm Triggers
         svd_sparsity_trigger: float = 0.40,
         mice_correlation_min: float = 0.10,
         cardinality_ratio_max: float = 0.05,
+        nlp_text_length_trigger: float = 40.0,
+        
+        # Execution Modes
         time_series_mode: bool = False,
         deep_learning_mode: bool = True
     ) -> None:
         """
-        Initializes the Scanner with an extensive array of heuristic parameters.
+        Initializes the Scanner with an extensive array of enterprise heuristic parameters.
         
         Args:
-            target_columns (Optional[List[str]]): Specific columns to profile. If None, scans all.
-            max_cores (Optional[int]): Cores for parallel chunk mapping.
-            drop_threshold (float): % of NaNs above which column is dropped (Default: 85%).
+            drop_threshold (float): % of NaNs above which column is dropped.
             constant_variance_drop (bool): Drop columns where all values are identical.
             skewness_high_threshold (float): Threshold to shift from Mean to Median/KNN.
-            skewness_extreme_threshold (float): Threshold to trigger Outlier capping + Mahalanobis.
+            skewness_extreme_threshold (float): Threshold to trigger transformations (Yeo-Johnson).
+            kurtosis_threshold (float): Threshold indicating heavy-tailed distributions (Outlier swarms).
             outlier_z_threshold (float): Standard deviations to define an extreme outlier.
+            zero_inflation_trigger (float): % of zeros triggering Zero-Inflated imputation layers.
             svd_sparsity_trigger (float): Missing % threshold to recommend Matrix Factorization (SVD).
             mice_correlation_min (float): Minimum missing % to justify heavy MICE iteration.
             cardinality_ratio_max (float): Max unique/total ratio for categorical variables.
+            nlp_text_length_trigger (float): Average string length to classify column as NLP Free-Text.
             time_series_mode (bool): If True, biases towards Spline/Kalman interpolation.
             deep_learning_mode (bool): If True, allows Neural Autoencoder recommendations.
         """
-        self.target_columns = target_columns
-        self.max_cores = max_cores or max(1, (os.cpu_count() or 4) - 1)
-        
-        # Heuristic Configuration Matrix
         self.drop_threshold = drop_threshold
         self.constant_variance_drop = constant_variance_drop
         self.skew_high = skewness_high_threshold
         self.skew_extreme = skewness_extreme_threshold
+        self.kurtosis_threshold = kurtosis_threshold
         self.outlier_z = outlier_z_threshold
+        self.zero_inflation_trigger = zero_inflation_trigger
+        
         self.svd_trigger = svd_sparsity_trigger
         self.mice_trigger = mice_correlation_min
         self.cardinality_max = cardinality_ratio_max
+        self.nlp_trigger = nlp_text_length_trigger
+        
         self.time_series_mode = time_series_mode
         self.deep_learning_mode = deep_learning_mode
         
-        # State Tracking
         self.global_stats: Dict[str, Dict[str, Any]] = {}
-        
-        logger.info(f"Scanner Armed. Engine Cores: {self.max_cores} | Target Columns: {self.target_columns or 'ALL'}")
+        logger.info("Scanner Initialization Complete. Ready to process reduced mathematical streams.")
 
-    def _reduce_stats(self, all_chunk_stats: List[Dict[str, Dict[str, Any]]]) -> None:
+    def reduce_stats(self, all_chunk_stats: List[Dict[str, Dict[str, Any]]]) -> None:
         """
         The Master Reducer (Phase 2 of MapReduce).
-        Merges intermediate statistics from all chunks to form a 100% accurate Global State.
+        Merges a list of intermediate chunk statistics into a single Global State Matrix.
+        
+        Args:
+            all_chunk_stats (List[Dict]): A list containing the outputs of `extract_chunk_statistics`.
         """
-        logger.info("Reducing chunk statistics into Global State Matrices...")
+        logger.debug("Reducing chunk statistics into Global State Matrices...")
         
         for chunk in all_chunk_stats:
             for col, stats in chunk.items():
                 if col not in self.global_stats:
+                    # Initialize global aggregator for this column
                     self.global_stats[col] = {
                         "total_rows": 0, "missing_count": 0, "valid_count": 0,
                         "is_numeric": stats["is_numeric"], "is_discrete": stats.get("is_discrete", False),
-                        "sum_x": 0.0, "sum_x2": 0.0, "sum_x3": 0.0,
+                        "sum_x": 0.0, "sum_x2": 0.0, "sum_x3": 0.0, "sum_x4": 0.0,
+                        "zero_count": 0, "negative_count": 0,
                         "min": float('inf'), "max": float('-inf'),
-                        "unique_set": set(), "high_cardinality_flag": False
+                        "unique_set": set(), "high_cardinality_flag": False,
+                        "sum_text_len": 0, "max_text_len": 0
                     }
                 
                 g = self.global_stats[col]
@@ -182,12 +206,18 @@ class DataScanner:
                     g["sum_x"] += stats["sum_x"]
                     g["sum_x2"] += stats["sum_x2"]
                     g["sum_x3"] += stats["sum_x3"]
+                    g["sum_x4"] += stats["sum_x4"]
+                    g["zero_count"] += stats["zero_count"]
+                    g["negative_count"] += stats["negative_count"]
                     g["min"] = min(g["min"], stats["min"])
                     g["max"] = max(g["max"], stats["max"])
-                    # If any chunk is not discrete, the global column is not discrete
+                    
                     if not stats.get("is_discrete", True):
                         g["is_discrete"] = False
                 else:
+                    g["sum_text_len"] += stats["sum_text_len"]
+                    g["max_text_len"] = max(g["max_text_len"], stats["max_text_len"])
+                    
                     if not g["high_cardinality_flag"]:
                         g["unique_set"].update(stats.get("unique_sample", set()))
                         if len(g["unique_set"]) > 100000 or stats.get("high_cardinality_flag", False):
@@ -196,40 +226,52 @@ class DataScanner:
 
     def _derive_global_mathematics(self) -> None:
         """
-        Extracts complex mathematical moments (Variance, Skewness, StdDev) 
-        from the aggregated sum matrices.
+        Derives high-level Population Mathematics (Variance, Skewness, Kurtosis) 
+        from the raw central moments using advanced statistical formulas.
         """
         for col, g in self.global_stats.items():
             g["missing_ratio"] = g["missing_count"] / g["total_rows"] if g["total_rows"] > 0 else 1.0
             
-            if g["is_numeric"] and g["valid_count"] > 2:
+            if g["is_numeric"] and g["valid_count"] > 3:
                 N = g["valid_count"]
                 mean = g["sum_x"] / N
                 
-                # Global Variance & Standard Deviation
+                # Variance (M2)
                 variance = max(0.0, (g["sum_x2"] / N) - (mean ** 2))
                 std_dev = math.sqrt(variance)
                 
-                # Global Skewness (Derived from central moments)
+                # Higher Order Moments (Skewness & Kurtosis)
                 if std_dev > 0:
-                    # Skewness = [E(x^3) - 3*mu*sigma^2 - mu^3] / sigma^3 (Approximate Population Skew)
-                    m3_expected = g["sum_x3"] / N
-                    skewness = (m3_expected - 3 * mean * variance - (mean ** 3)) / (std_dev ** 3)
+                    # M3 (Third Central Moment) for Skewness
+                    m3 = (g["sum_x3"] / N) - 3 * mean * (g["sum_x2"] / N) + 2 * (mean ** 3)
+                    skewness = m3 / (std_dev ** 3)
+                    
+                    # M4 (Fourth Central Moment) for Kurtosis (Pearson's)
+                    m4 = (g["sum_x4"] / N) - 4 * mean * (g["sum_x3"] / N) + 6 * (mean ** 2) * (g["sum_x2"] / N) - 3 * (mean ** 4)
+                    kurtosis = m4 / (std_dev ** 4)
                 else:
                     skewness = 0.0
+                    kurtosis = 0.0
                     
                 g["global_mean"] = mean
                 g["global_std"] = std_dev
                 g["global_skewness"] = skewness
+                g["global_kurtosis"] = kurtosis
+                g["zero_ratio"] = g["zero_count"] / N
                 
             elif not g["is_numeric"] and g["valid_count"] > 0:
                 g["cardinality_ratio"] = len(g["unique_set"]) / g["valid_count"] if not g["high_cardinality_flag"] else 1.0
+                g["avg_text_len"] = g["sum_text_len"] / g["valid_count"]
 
-    def _apply_decision_matrix(self) -> Dict[str, Dict[str, Any]]:
+    def generate_blueprint(self) -> Dict[str, Dict[str, Any]]:
         """
-        The Brain (Phase 3). Evaluates Global Mathematics against strict Heuristic Rules 
-        to assign the most advanced execution algorithms.
+        The Brain Engine (Phase 3). Evaluates the derived Population Mathematics 
+        against a strict AI Heuristic Ruleset to construct the Final Master Blueprint.
+        
+        Returns:
+            Dict[str, Dict[str, Any]]: The finalized Master Execution Blueprint.
         """
+        self._derive_global_mathematics()
         blueprint: Dict[str, Dict[str, Any]] = {}
         
         for col, g in self.global_stats.items():
@@ -239,7 +281,7 @@ class DataScanner:
             
             blueprint[col] = {"cleaning_pipeline": pipeline, "memory_optimization": mem_opt}
             
-            # --- ABSOLUTE RULES ---
+            # --- ABSOLUTE SPARSITY & HYGIENE RULES ---
             if missing_ratio == 1.0:
                 pipeline.append("drop_column_all_nan")
                 continue
@@ -257,65 +299,77 @@ class DataScanner:
                 continue
 
             # --- NUMERICAL AI IMPUTATION LOGIC ---
-            if g["is_numeric"] and missing_ratio > 0:
+            if g["is_numeric"]:
                 skew = abs(g.get("global_skewness", 0.0))
+                kurtosis = g.get("global_kurtosis", 0.0)
                 is_discrete = g.get("is_discrete", False)
                 
-                # Check for extreme outliers (Max/Min vs Z-Threshold)
-                mean = g.get("global_mean", 0)
-                std = g.get("global_std", 1)
+                # 1. Distribution Shape & Outlier Management
+                mean, std = g.get("global_mean", 0), g.get("global_std", 1)
                 has_extreme_outliers = (abs(g["max"] - mean) / std > self.outlier_z) or (abs(g["min"] - mean) / std > self.outlier_z)
 
-                if has_extreme_outliers:
-                    pipeline.append("outlier_capper_iqr")
+                if has_extreme_outliers or kurtosis > self.kurtosis_threshold:
+                    if g["negative_count"] > 0:
+                        pipeline.append("yeo_johnson_transformer") # Handles negative skewed data
+                    else:
+                        pipeline.append("isolation_forest_outlier_remover") # Advanced ML outlier detection
+                elif skew > self.skew_extreme:
+                    pipeline.append("box_cox_transformer") # Standard power transform for strictly positive data
 
-                # Time-Series Override
-                if self.time_series_mode:
-                    pipeline.append("spline_interpolation" if not is_discrete else "ffill_bfill_imputer")
-                
-                # Extreme Sparsity (Matrix Factorization & Deep Learning)
-                elif missing_ratio > self.svd_trigger:
-                    if self.deep_learning_mode and not is_discrete:
-                        pipeline.append("autoencoder_deep_imputer")
-                    else:
-                        pipeline.append("svd_matrix_factorization")
-                        
-                # Complex Multivariate Structure (MICE & Mahalanobis)
-                elif missing_ratio > self.mice_trigger:
-                    if skew > self.skew_extreme:
-                        pipeline.append("mahalanobis_knn_imputer") # Handles skewed covariance
-                    elif is_discrete:
-                        pipeline.append("pmm_imputer") # Predictive Mean Matching for discrete counts (e.g. Cars)
-                    else:
-                        pipeline.append("mice_iterative_imputer") # Gold standard for normal-ish multivariates
-                        
-                # Standard Distribution Thresholds
-                else:
-                    if skew > self.skew_high:
-                        pipeline.append("knn_imputer" if missing_ratio > 0.02 else "median_imputer")
-                    else:
-                        # Expectation-Maximization is elegant for minor normal data gaps
-                        pipeline.append("em_algorithm_imputer" if missing_ratio > 0.01 else "mean_imputer")
-            
-            # --- CATEGORICAL/TEXT AI IMPUTATION LOGIC ---
-            elif not g["is_numeric"]:
+                # 2. Missing Value Imputation Algorithms
                 if missing_ratio > 0:
-                    cardinality = g.get("cardinality_ratio", 1.0)
-                    
-                    if cardinality < self.cardinality_max:
-                        pipeline.append("mode_imputer")
-                    elif self.deep_learning_mode:
-                        pipeline.append("missforest_categorical_imputer")
-                    else:
-                        pipeline.append("flag_missing_text")
+                    if self.time_series_mode:
+                        pipeline.append("spline_interpolation" if not is_discrete else "ffill_bfill_imputer")
                         
-                # Text structural hygiene
-                pipeline.append("regex_whitespace_cleaner")
+                    elif g.get("zero_ratio", 0.0) > self.zero_inflation_trigger:
+                        pipeline.append("zero_inflated_poisson_imputer") # Specialized for heavy-zero data
+                        
+                    elif missing_ratio > self.svd_trigger:
+                        if self.deep_learning_mode and not is_discrete:
+                            pipeline.append("autoencoder_deep_imputer")
+                        else:
+                            pipeline.append("svd_matrix_factorization")
+                            
+                    elif missing_ratio > self.mice_trigger:
+                        if skew > self.skew_extreme:
+                            pipeline.append("mahalanobis_knn_imputer") 
+                        elif is_discrete:
+                            pipeline.append("pmm_imputer") 
+                        else:
+                            pipeline.append("mice_iterative_imputer") 
+                            
+                    else:
+                        if skew > self.skew_high:
+                            pipeline.append("knn_imputer" if missing_ratio > 0.02 else "median_imputer")
+                        else:
+                            pipeline.append("em_algorithm_imputer" if missing_ratio > 0.01 else "mean_imputer")
+            
+            # --- CATEGORICAL & NLP TEXT IMPUTATION LOGIC ---
+            elif not g["is_numeric"]:
+                avg_len = g.get("avg_text_len", 0.0)
+                
+                # Detect if this is Free-Text (NLP) or just Categorical
+                if avg_len >= self.nlp_trigger:
+                    pipeline.append("nlp_text_cleaner")
+                    if missing_ratio > 0:
+                        pipeline.append("empty_string_imputer")
+                else:
+                    if missing_ratio > 0:
+                        cardinality = g.get("cardinality_ratio", 1.0)
+                        if cardinality < self.cardinality_max:
+                            pipeline.append("mode_imputer")
+                        elif self.deep_learning_mode:
+                            pipeline.append("missforest_categorical_imputer")
+                        else:
+                            pipeline.append("flag_missing_text")
+                    
+                    pipeline.append("regex_whitespace_cleaner")
 
             # --- MEMORY OPTIMIZATION DECISIONS ---
             if g["is_numeric"]:
                 min_v, max_v = g["min"], g["max"]
-                if g.get("is_discrete", False):
+                if g.get("is_discrete", False) and g["missing_count"] == 0:
+                    # Strict integer casting if no NaNs (Pandas Int8 supports NaNs, but standard int doesn't)
                     if min_v >= -128 and max_v <= 127: mem_opt = "cast:Int8"
                     elif min_v >= -32768 and max_v <= 32767: mem_opt = "cast:Int16"
                     else: mem_opt = "cast:Int32"
@@ -324,62 +378,13 @@ class DataScanner:
             else:
                 if g.get("cardinality_ratio", 1.0) < self.cardinality_max:
                     mem_opt = "cast:category"
-                else:
+                elif g.get("avg_text_len", 0.0) < self.nlp_trigger:
                     mem_opt = "cast:string[pyarrow]"
                     
             blueprint[col]["cleaning_pipeline"] = pipeline
             blueprint[col]["memory_optimization"] = mem_opt
 
-        logger.info("Blueprint Logic Engine successfully generated architectural instructions.")
+        logger.info("Blueprint Logic Engine successfully generated advanced architectural instructions.")
         return blueprint
 
-    def scan_stream(self, chunk_generator) -> Dict[str, Dict[str, Any]]:
-        """
-        The Main Public API for Pass 1. 
-        Takes a generator of chunks from the Loader, executes parallel mapping, 
-        reduces the stats globally, and outputs the final Master Blueprint.
-        
-        Args:
-            chunk_generator: A generator yielding pd.DataFrame chunks.
-            
-        Returns:
-            Dict: The Master Execution Blueprint for the Reconstructor and Engine.
-        """
-        logger.info(f"Initiating Pass 1: Global Streaming MapReduce on {self.max_cores} cores.")
-        all_chunk_stats = []
-        
-        # PHASE 1: Parallel Map Execution
-        with ProcessPoolExecutor(max_workers=self.max_cores) as executor:
-            futures = []
-            # We submit chunks as they are generated. 
-            for chunk in chunk_generator:
-                futures.append(
-                    executor.submit(_map_chunk_stats, chunk, self.target_columns)
-                )
-                
-            for future in as_completed(futures):
-                try:
-                    chunk_stats = future.result()
-                    all_chunk_stats.append(chunk_stats)
-                except Exception as e:
-                    logger.error(f"Map Worker Failed during scanning: {e}")
-                    raise
-                    
-        if not all_chunk_stats:
-            logger.warning("No data was scanned. Returning empty blueprint.")
-            return {}
-
-        # PHASE 2 & 3: Reduce & Decide (Main Thread - Microseconds to execute)
-        self._reduce_stats(all_chunk_stats)
-        self._derive_global_mathematics()
-        master_blueprint = self._apply_decision_matrix()
-        
-        return master_blueprint
-
-
-# ==========================================
-# EXAMPLE INTEGRATION
-# ==========================================
-if __name__ == "__main__":
-    # this is called by engine.py/core.py passing the Loader's generator
-    pass
+    
