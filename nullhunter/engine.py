@@ -1,11 +1,33 @@
+"""
+NullHunter Execution Engine
+=================================================
+
+This module acts as the isolated Pass-2 Execution Pipeline for the NullHunter framework.
+It operates purely on the "Delegation Pattern", receiving planning assets (Blueprint, 
+Master Ledger) from the core.py and executing them using the 
+UniversalParallelRunner.
+
+Key Architectural Pillars:
+1. Dynamic Dispatch (Registry Pattern): Eliminates if-else spaghetti logic.
+2. Dumb Core Routing: Defers RAM management entirely to the Loader. It only maps 
+   batches strictly to the available CPU count to prevent OS UI freezing.
+3. Fault Tolerance & Atomic I/O: Implements exponential backoff for disk writes.
+4. Granular Telemetry: Tracks microsecond-level execution times per transformation.
+"""
+
 import os
 import gc
+import time
+import signal
 import logging
-import psutil
+import itertools
 import pandas as pd
 from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import Dict, Any, List, Optional, Union
+from dataclasses import dataclass, field
+from typing import Dict, Any, List, Optional, Union, Callable, Tuple, Generator
+
+from nullhunter.utils.runner import UniversalParallelRunner 
+
 
 # ==========================================
 # LOGGER CONFIGURATION
@@ -17,301 +39,377 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
 # ==========================================
 # CUSTOM EXCEPTIONS
 # ==========================================
 class NullHunterEngineError(Exception):
-    """Raised when the execution engine encounters a fatal routing or I/O error."""
+    """Raised when the execution engine encounters a fatal orchestration error."""
     pass
 
 class NullHunterNotImplementedError(Exception):
-    """Raised when the blueprint requests a layer that does not exist in the registry."""
+    """Raised when the blueprint requests a tool that does not exist in the registry."""
     pass
 
-class NullHunterStateError(Exception):
-    """Raised when the Master Ledger loses synchronization with the dataframe shape."""
+class NullHunterDiskIOError(Exception):
+    """Raised when the engine fails to write to the disk after maximum retries."""
     pass
 
-# ==========================================
-# SIMULATED LAYER REGISTRY (For Dependency Injection)
-# ==========================================
-# In a real framework, this would be imported from nullhunter.layers
-LAYER_REGISTRY: Dict[str, Any] = {
-    # 'knn_imputer': knn_imputer_function,
-    # 'type_caster': type_caster_function,
-    # 'outlier_capper': outlier_capper_function,
-}
 
 # ==========================================
-# STATIC WORKER FUNCTION (Isolated Process Router)
+# DATA STRUCTURES
 # ==========================================
-def _worker_process_chunk(
+@dataclass
+class ChunkTelemetry:
+    """
+    Data class for storing micro-metrics of a single chunk's execution.
+    Returned alongside the dataframe by the UDF to feed the master telemetry.
+    """
+    chunk_id: str
+    total_time_sec: float = 0.0
+    tools_applied: List[str] = field(default_factory=list)
+    memory_saved_mb: float = 0.0
+    error_flag: bool = False
+    error_msg: str = ""
+
+
+# ==========================================
+# TOOL REGISTRY
+# ==========================================
+class _ToolRegistry:
+    """
+    A robust registry for maintaining analytical tools.
+    Provides isolation, validation, and dynamic dispatching capabilities.
+    """
+    def __init__(self):
+        self._tools: Dict[str, Callable] = {}
+
+    def register(self, name: str) -> Callable:
+        """
+        Decorator to dynamically register a processing tool into the engine's armory.
+        
+        Args:
+            name (str): The exact string key present in the AI Blueprint.
+            
+        Returns:
+            Callable: The decorator function.
+        """
+        def decorator(func: Callable) -> Callable:
+            if not callable(func):
+                raise TypeError(f"Registered tool '{name}' must be a callable function.")
+            if name in self._tools:
+                logger.warning(f"Overwriting existing tool '{name}' in the registry.")
+            self._tools[name] = func
+            return func
+        return decorator
+
+    def get_tool(self, name: str) -> Optional[Callable]:
+        """Retrieves a tool by name securely."""
+        return self._tools.get(name)
+
+    def list_tools(self) -> List[str]:
+        """Returns a list of all currently registered tools."""
+        return list(self._tools.keys())
+
+# Instantiate the global Registry
+registry = _ToolRegistry()
+
+
+# --- Dummy Implementations for Registry (To be moved to nullhunter.tools later) ---
+@registry.register("drop_column")
+def _tool_drop_column(chunk: pd.DataFrame, col: str, **kwargs) -> pd.DataFrame:
+    if col in chunk.columns:
+        return chunk.drop(columns=[col])
+    return chunk
+
+
+# ==========================================
+# THE ISOLATED CPU WORKER (UDF for Runner)
+# ==========================================
+def _apply_blueprint_to_chunk(
     chunk: pd.DataFrame, 
     blueprint: Dict[str, Dict[str, Any]]
-) -> pd.DataFrame:
+) -> Tuple[pd.DataFrame, ChunkTelemetry]:
     """
-    The Pure DAG Router (Isolated CPU Worker).
+    The Pure DAG Router (Worker UDF).
     
-    This function operates in a completely decoupled manner. It does not perform any
-    mathematical operations or memory casting itself. It strictly acts as a router,
-    passing the data column to the appropriate standalone layer from the registry based
-    on the Scanner's blueprint.
+    Operates in isolated global scope for Pickle serialization. It applies transformations
+    based on the AI blueprint and records granular execution metrics.
+    
+    Note on Execution Order: Memory Optimization (type casting) is strictly executed 
+    AFTER all mathematical operations (imputation/capping) to prevent precision loss 
+    or TypeErrors during execution.
     
     Args:
         chunk (pd.DataFrame): The flattened 2D DataFrame chunk.
-        blueprint (Dict): The JSON-like execution instructions from the Scanner.
+        blueprint (Dict[str, Dict[str, Any]]): Execution instructions per column.
         
     Returns:
-        pd.DataFrame: The processed and optimized chunk.
+        Tuple[pd.DataFrame, ChunkTelemetry]: The cleaned chunk and its micro-metrics.
         
     Raises:
-        NullHunterNotImplementedError: If a requested layer is missing.
+        RuntimeError: If a tool crashes during execution.
+        NullHunterNotImplementedError: If a requested tool is missing.
     """
+    start_time = time.perf_counter()
+    initial_mem = chunk.memory_usage(deep=True).sum() / (1024 ** 2)
+    
+    # Defensive copy to prevent modifying the original reference
     processed_chunk = chunk.copy(deep=False)
+    
+    # Use index 0 as a mock chunk ID if real ID isn't present
+    chunk_id = str(processed_chunk.index[0]) if not processed_chunk.empty else "empty_chunk"
+    metrics = ChunkTelemetry(chunk_id=chunk_id)
     
     for col, instructions in blueprint.items():
         if col not in processed_chunk.columns:
-            logger.debug(f"Column '{col}' not found in current chunk. Skipping.")
             continue
             
         pipeline = instructions.get("cleaning_pipeline", [])
         mem_opt = instructions.get("memory_optimization", None)
         
-        # 1. Smart Lazy Evaluation (Skip heavy math if data is already clean)
+        # 1. Smart Lazy Evaluation
         has_nulls = processed_chunk[col].isnull().any()
         
-        # Execute Cleaning Pipeline
-        for layer_name in pipeline:
-            if layer_name == "drop_column":
-                processed_chunk = processed_chunk.drop(columns=[col])
-                break # Terminate pipeline for this dropped column
-                
-            # Lazy skip for imputation layers
-            if "imputer" in layer_name and not has_nulls:
+        # 2. Execute Mathematical Pipeline (Dynamic Dispatch)
+        for tool_name in pipeline:
+            if "imputer" in tool_name and not has_nulls:
                 continue
                 
-            # Strict Separation of Concerns: Delegate to External Layer
-            if layer_name in LAYER_REGISTRY:
-                try:
-                    processed_chunk = LAYER_REGISTRY[layer_name](processed_chunk, col)
-                except Exception as e:
-                    logger.error(f"Layer '{layer_name}' crashed on column '{col}': {str(e)}")
-                    raise
-            else:
-                # The framework enforces development completeness
+            active_tool = registry.get_tool(tool_name)
+            if not active_tool:
                 raise NullHunterNotImplementedError(
-                    f"Scanner requested '{layer_name}' for column '{col}', "
-                    f"but this layer is not registered in the framework."
+                    f"Blueprint requested '{tool_name}' for '{col}', but it is missing."
                 )
                 
-        # 2. Execute Memory Optimization (Delegated to type_caster layer)
+            try:
+                processed_chunk = active_tool(processed_chunk, col)
+                metrics.tools_applied.append(f"{col}:{tool_name}")
+            except Exception as e:
+                metrics.error_flag = True
+                metrics.error_msg = f"Tool '{tool_name}' failed on '{col}': {str(e)}"
+                raise RuntimeError(metrics.error_msg)
+                
+            if col not in processed_chunk.columns:
+                break
+                
+        # 3. Execute Memory Optimization (Strictly separate and executed last)
         if mem_opt and col in processed_chunk.columns:
-            if "type_caster" in LAYER_REGISTRY:
-                # The engine no longer hardcodes .astype(). It delegates the command.
-                processed_chunk = LAYER_REGISTRY["type_caster"](processed_chunk, col, mem_opt)
+            caster = registry.get_tool("type_caster")
+            if caster:
+                try:
+                    processed_chunk = caster(processed_chunk, col, target_type=mem_opt)
+                    metrics.tools_applied.append(f"{col}:type_caster")
+                except Exception as e:
+                    logger.debug(f"Memory optimization failed on '{col}': {e}")
             else:
-                raise NullHunterNotImplementedError(
-                    f"Memory optimization '{mem_opt}' requested, but the 'type_caster' "
-                    f"layer is missing from the registry."
-                )
+                logger.debug("Skipping memory optimization: 'type_caster' not registered.")
                 
-    return processed_chunk
+    # Finalize Metrics
+    final_mem = processed_chunk.memory_usage(deep=True).sum() / (1024 ** 2)
+    metrics.memory_saved_mb = max(0.0, initial_mem - final_mem)
+    metrics.total_time_sec = time.perf_counter() - start_time
+    
+    return processed_chunk, metrics
 
 
 # ==========================================
-# THE MASTER ORCHESTRATOR
+# THE Execution Engine
 # ==========================================
 class ExecutionEngine:
     """
-    The CPU Master Commander for Project NullHunter.
+    The Execution Pipeline Worker.
     
-    Solely responsible for orchestrating the flow of perfectly-sized chunks (provided 
-    by the smart DataLoader) across the available CPU cores. It manages state synchronization 
-    (Master Ledger), process pooling, and Disk I/O without interfering with RAM logic.
+    Operates strictly in Pass-2. Takes the pre-calculated Blueprint and Master Ledger 
+    from the core.py and orchestrates the massive data flow.
+    
+    Responsibilities:
+    - Maintains OS stability by reserving exactly 1 CPU core.
+    - Streams data efficiently using `itertools.islice`.
+    - Handles exponential backoff for disk I/O to prevent file locking crashes.
     """
-
+    
     def __init__(
         self, 
         loader_ref: Any, 
-        flattener_ref: Any, 
-        optimizer_ref: Any,
-        scanner_ref: Any,
         reconstructor_ref: Any,
+        parallel_runner_ref: UniversalParallelRunner,
         max_cores: Optional[int] = None
     ) -> None:
         """
-        Initializes the CPU Commander and internal sub-system references.
+        Initializes the Engine with external dependencies.
+        
+        Args:
+            loader_ref (Any): Reference to the instantiated DataLoader.
+            reconstructor_ref (Any): Reference to the instantiated Reconstructor.
+            parallel_runner_ref (UniversalParallelRunner): The God-Mode executor.
+            max_cores (Optional[int]): Hard limit for cores. Defaults to N-1.
         """
         self.loader = loader_ref
-        self.flattener = flattener_ref
-        self.optimizer = optimizer_ref
-        self.scanner = scanner_ref
         self.reconstructor = reconstructor_ref
+        self.runner = parallel_runner_ref
         
-        # Pure CPU Configuration
         self.system_cores = os.cpu_count() or 4
-        # Reserve 1 core for the OS/Background tasks to prevent system UI freeze
+        # N-1 Logic: Prevents OS freezing by keeping 1 core free.
         self.max_cores = max_cores if max_cores else max(1, self.system_cores - 1)
         
-        # State Management
-        self.master_ledger: Dict[str, Any] = {}
-        self.blueprint: Dict[str, Dict[str, Any]] = {}
+        self._shutdown_flag = False
+        self._register_signals()
         
-        logger.info(f"ExecutionEngine initialized. Commanding {self.max_cores} dedicated CPU cores.")
+        logger.info(f"ExecutionEngine Armed. Target Capacity: {self.max_cores} parallel streams.")
 
-    def _sync_master_ledger(self, flat_map: Dict[str, Any], opt_map: Dict[str, str]) -> None:
-        """
-        Fuses structural and semantic maps to maintain the Chain of Custody.
-        Ensures the Reconstructor has the exact mathematical reverse-mapping required.
-        """
-        if not flat_map or not opt_map:
-            raise NullHunterStateError("Received empty state maps during Ledger Synchronization.")
-            
-        for new_name, flat_name in opt_map.items():
-            original_structure = flat_map.get(flat_name, flat_name)
-            self.master_ledger[new_name] = original_structure
-            
-        logger.debug("Master Ledger successfully synchronized for downstream reconstruction.")
 
-    def _process_in_memory_fast_path(self, df: pd.DataFrame, mode: str, user_blueprint: dict) -> pd.DataFrame:
-        """
-        The Zero-Overhead Bypass Mode.
-        Activated when the Loader passes a single, monolithic DataFrame (File is tiny).
-        """
-        logger.info("Engaging Fast Path. Executing sequentially on Main Thread.")
-        
-        # 1. Pipeline Prep
-        flat_df, flat_map = self.flattener.flatten(df)
-        opt_df, opt_map = self.optimizer.optimize(flat_df)
-        self._sync_master_ledger(flat_map, opt_map)
-        
-        # 2. Intelligence Routing
-        if mode == 'auto':
-            self.blueprint = self.scanner.scan(opt_df)
-        else:
-            self.blueprint = user_blueprint
-            
-        # 3. Direct Execution
-        clean_df = _worker_process_chunk(opt_df, self.blueprint)
-        
-        # 4. Final Reconstruction
-        return self.reconstructor.rebuild(clean_df, self.master_ledger)
+    def _register_signals(self) -> None:
+        """Registers OS signals to allow graceful shutdown without corrupting the CSV."""
+        try:
+            signal.signal(signal.SIGINT, self._handle_shutdown)
+            signal.signal(signal.SIGTERM, self._handle_shutdown)
+        except ValueError:
+            # Occurs if not running in the main thread; safe to ignore.
+            pass
 
-    def _process_out_of_core(self, filepath: str, mode: str, user_blueprint: dict) -> str:
+    def _handle_shutdown(self, signum: int, frame: Any) -> None:
+        """Gracefully halts the pipeline on Ctrl+C."""
+        logger.warning("\n[ALERT] Termination signal received. Halting pipeline gracefully...")
+        self._shutdown_flag = True
+
+
+    def _safe_disk_write(self, df: pd.DataFrame, path: Path, is_first: bool) -> None:
         """
-        The Core Distribution Protocol (Beast Mode).
+        Writes dataframe to disk with an Exponential Backoff Retry mechanism.
+        Protects against temporary OS-level file locks.
         
-        Trusts the Loader to provide perfectly sized chunks. Pulls exactly `max_cores` 
-        number of chunks, maps them to the CPU pool, and flushes to disk upon completion 
-        to maintain a continuous, memory-safe processing stream.
+        Args:
+            df (pd.DataFrame): The final reconstructed chunk.
+            path (Path): Destination file path.
+            is_first (bool): Determines if headers should be written and file overwritten.
+            
+        Raises:
+            NullHunterDiskIOError: If all retries fail.
         """
-        logger.info(f"Engaging Out-of-Core Processing. Target: {self.max_cores} parallel streams.")
+        max_retries = 3
+        write_mode = 'w' if is_first else 'a'
+        write_header = is_first
         
-        output_file = Path("nullhunter_output.csv")
-        is_first_chunk = True
-        
-        chunk_generator = self.loader.get_chunks()
-        
-        while True:
-            # 1. CPU-Bound Polling (The Engine only requests what the CPU can handle simultaneously)
-            batch_chunks = []
+        for attempt in range(max_retries):
             try:
-                for _ in range(self.max_cores):
-                    batch_chunks.append(next(chunk_generator))
-            except StopIteration:
-                pass 
+                df.to_csv(path, mode=write_mode, index=False, header=write_header)
+                return  # Success
+            except PermissionError as e:
+                logger.warning(f"Disk locked by OS. Retry {attempt + 1}/{max_retries}...")
+                time.sleep(1.5 ** attempt) # Exponential backoff: 1s, 1.5s, 2.25s
+            except Exception as e:
+                raise NullHunterDiskIOError(f"Unexpected I/O failure: {str(e)}")
                 
-            if not batch_chunks:
-                break # Stream exhausted, exit loop
+        raise NullHunterDiskIOError(f"Failed to write to '{path}' after {max_retries} attempts.")
 
-            # 2. Initialization Phase (Global State Setup)
-            if is_first_chunk:
-                first_chunk = batch_chunks[0]
-                flat_df, flat_map = self.flattener.flatten(first_chunk)
-                opt_df, opt_map = self.optimizer.optimize(flat_df)
-                self._sync_master_ledger(flat_map, opt_map)
-                
-                if mode == 'auto':
-                    logger.info("Extracting AI Blueprint from leading chunk matrix...")
-                    self.blueprint = self.scanner.scan(opt_df)
-                else:
-                    self.blueprint = user_blueprint
-                
-                is_first_chunk = False
 
-            # 3. Pre-Processing Dispatch Queue
-            prepared_batch = []
-            for c in batch_chunks:
-                f_c, _ = self.flattener.flatten(c)
-                o_c, _ = self.optimizer.optimize(f_c)
-                prepared_batch.append(o_c)
-
-            processed_batch = []
-            logger.info(f"Deploying batch of {len(prepared_batch)} chunks across active CPUs...")
-            
-            # 4. Parallel Core Execution
-            with ProcessPoolExecutor(max_workers=self.max_cores) as executor:
-                # futures list preserves the state; as_completed yields them as they finish
-                futures = [
-                    executor.submit(_worker_process_chunk, chunk, self.blueprint) 
-                    for chunk in prepared_batch
-                ]
-                for future in as_completed(futures):
-                    # Will implicitly raise any NullHunterNotImplementedError that occurred in the worker
-                    processed_batch.append(future.result())
-
-            # 5. Continuous Disk Flush (OOM Prevention)
-            for clean_chunk in processed_batch:
-                final_chunk = self.reconstructor.rebuild(clean_chunk, self.master_ledger)
-                
-                write_mode = 'w' if not output_file.exists() else 'a'
-                write_header = not output_file.exists()
-                final_chunk.to_csv(output_file, mode=write_mode, index=False, header=write_header)
-            
-            # 6. Strict Memory Sweeping
-            del batch_chunks
-            del prepared_batch
-            del processed_batch
-            gc.collect()
-
-        logger.info(f"Processing sequence complete. Data serialized to: {output_file}")
-        return str(output_file)
-
-    def execute(
+    def execute_pipeline(
         self, 
-        data: Union[str, pd.DataFrame, pd.Series], 
-        mode: str = 'auto', 
-        blueprint: Optional[Dict] = None
-    ) -> Union[pd.DataFrame, pd.Series, str]:
+        destination: Union[str, Path],
+        master_ledger: Dict[str, Any],
+        blueprint: Dict[str, Dict[str, Any]],
+        fail_fast: bool = False
+    ) -> Dict[str, Any]:
         """
-        The External Entry Point.
-        Normalizes single-dimension Series and routes based on input location (RAM vs Disk).
-        """
-        was_series = False
+        The Master Execution Loop.
         
-        if isinstance(data, pd.Series):
-            was_series = True
-            data = data.to_frame()
-            logger.info("Series dimensional expansion applied. Escalating to DataFrame.")
-
-        if isinstance(data, pd.DataFrame):
-            result = self._process_in_memory_fast_path(data, mode, blueprint)
-            return result.squeeze() if was_series else result
+        Streams batches sequentially from the Loader matching the core capacity, 
+        processes them in parallel, and flushes to disk.
+        
+        Args:
+            destination (Union[str, Path]): Where the final cleaned CSV should be saved.
+            master_ledger (Dict[str, Any]): Mapping for the reconstructor. Empty if bypassed.
+            blueprint (Dict[str, Dict[str, Any]]): Execution instructions for the tools.
+            fail_fast (bool): If True, aborts the pipeline upon a single chunk failure.
             
-        elif isinstance(data, str) or isinstance(data, Path):
-            # Engine delegates RAM evaluation ENTIRELY to the Loader.
-            # If the Loader set fast_path=True during its internal math, it will 
-            # yield exactly 1 large DataFrame when get_chunks() is called.
-            # However, for API consistency, we can check the Loader's determined state here:
+        Returns:
+            Dict[str, Any]: A massive, SaaS-level telemetry report.
+        """
+        start_time = time.perf_counter()
+        output_file = Path(destination)
+        
+        telemetry = {
+            "status": "in_progress",
+            "total_chunks_processed": 0,
+            "total_chunks_failed": 0,
+            "total_memory_saved_mb": 0.0,
+            "failure_logs": [],
+            "execution_time_sec": 0.0,
+            "destination_path": str(output_file)
+        }
+        
+        logger.info(f"Initiating Pass-2 Execution Pipeline. Output: {output_file}")
+        
+        # Engine is "dumb" to RAM. It only pulls what it can compute simultaneously.
+        chunk_generator: Generator = self.loader.get_chunks()
+        is_first_write = True
+        
+        while not self._shutdown_flag:
+            # 1. Pull exact batch size using itertools (Clean & Pythonic)
+            batch_chunks = list(itertools.islice(chunk_generator, self.max_cores))
             
-            if self.loader._fast_path:
-                logger.info("Delegating to Main Thread (Loader specified Fast Path).")
-                # We pull the single monolith chunk the loader prepared
-                df = next(self.loader.get_chunks())
-                return self._process_in_memory_fast_path(df, mode, blueprint)
-            else:
-                logger.info("Delegating to Process Pool (Loader specified Chunk Path).")
-                return self._process_out_of_core(str(data), mode, blueprint)
+            if not batch_chunks:
+                break # Stream completely exhausted
                 
-        else:
-            raise NullHunterEngineError(f"Engine cannot process datatype: {type(data)}")
+            logger.info(f"Dispatching batch of {len(batch_chunks)} chunks to Runner...")
+            
+            # 2. Execute via God-Mode Runner
+            # The Runner returns a list of tuples: [(df, metrics), (df, metrics), ...]
+            runner_results, run_report = self.runner.execute(
+                func=_apply_blueprint_to_chunk,
+                payload=batch_chunks,
+                blueprint=blueprint
+            )
+            
+            telemetry["total_chunks_failed"] += run_report.get("failed_tasks", 0)
+            if run_report.get("failed_tasks", 0) > 0:
+                telemetry["failure_logs"].extend(run_report.get("failure_logs", []))
+                if fail_fast:
+                    logger.error("Fail-fast triggered. Aborting pipeline.")
+                    telemetry["status"] = "aborted"
+                    break
+
+            # 3. Process Success Returns & Safe Disk Flush
+            for result_tuple in runner_results:
+                if not isinstance(result_tuple, tuple) or len(result_tuple) != 2:
+                    continue
+                    
+                clean_chunk, chunk_metrics = result_tuple
+                
+                # Aggregate micro-metrics
+                telemetry["total_chunks_processed"] += 1
+                telemetry["total_memory_saved_mb"] += getattr(chunk_metrics, 'memory_saved_mb', 0.0)
+                
+                # O(1) Reconstruction
+                if master_ledger:
+                    final_chunk = self.reconstructor.rebuild(clean_chunk, master_ledger)
+                else:
+                    final_chunk = clean_chunk
+                    
+                # Atomic Write
+                self._safe_disk_write(final_chunk, output_file, is_first_write)
+                is_first_write = False
+            
+            # 4. Aggressive Memory Sweeping (GC)
+            del batch_chunks
+            del runner_results
+            gc.collect()
+            
+        if self._shutdown_flag:
+            telemetry["status"] = "interrupted_by_user"
+        elif telemetry["status"] != "aborted":
+            telemetry["status"] = "success"
+            
+        telemetry["execution_time_sec"] = round(time.perf_counter() - start_time, 4)
+        telemetry["total_memory_saved_mb"] = round(telemetry["total_memory_saved_mb"], 2)
+        
+        logger.info(
+            f"Pipeline Completed [{telemetry['status']}] in {telemetry['execution_time_sec']}s. "
+            f"Processed: {telemetry['total_chunks_processed']} | "
+            f"Failed: {telemetry['total_chunks_failed']} | "
+            f"RAM Saved: {telemetry['total_memory_saved_mb']} MB"
+        )
+                    
+        return telemetry
+    
