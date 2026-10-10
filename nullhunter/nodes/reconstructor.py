@@ -1,6 +1,6 @@
 """
-NullHunter Schema Reconstructor
-==================================================
+NullHunter Schema Reconstructor (The Time Machine)
+==============================================================
 
 This module acts as the independent Phase-3 exit node for the NullHunter framework.
 It performs an O(1) reverse-transformation of the metadata (Headers and Row Indices),
@@ -9,14 +9,16 @@ hierarchical shapes (MultiIndex) before they are flushed to disk.
 
 Key Architectural Pillars:
 1. Zero-Cost Abstraction: Manipulates only metadata, never iterating over rows.
-2. Complete Decoupling: Can be used entirely outside the NullHunter ecosystem.
+2. Complete Decoupling: Can be utilized entirely outside the NullHunter ecosystem.
 3. Consent-Driven Mutation: Adheres strictly to the `keep_optimized_headers` flag.
+4. Artifact Preservation: Safely integrates newly generated AI/ML columns into the 
+   legacy 3D hierarchical structure without causing Pandas length-mismatch crashes.
 """
 
 import time
 import logging
 import pandas as pd
-from typing import Dict, Any
+from typing import Dict, Any, List, Tuple, Literal
 
 # ==========================================
 # LOGGER CONFIGURATION
@@ -30,23 +32,60 @@ class NullHunterReconstructionError(Exception):
 
 class SchemaReconstructor:
     """
-    DataFrame Shape Restorer.
+    Enterprise-Grade DataFrame Shape Restorer.
     
     Transforms flattened ML-ready DataFrames back into their original, 
     human-readable, complex hierarchical shapes based on a Master Ledger.
+    
+    Attributes:
+        strict_validation (bool): If True, raises errors on unmapped columns.
+        unnamed_prefix (str): Placeholder flag used by the Flattener for blank levels.
+        unmapped_strategy (str): Action for newly generated columns ('drop', 'isolate').
+        fallback_level_name (str): Top-level name for newly isolated ML columns.
     """
     
-    def __init__(self, strict_validation: bool = False):
+    def __init__(
+        self, 
+        strict_validation: bool = False,
+        unnamed_prefix: str = "UNNAMED_LEVEL",
+        unmapped_strategy: Literal['drop', 'isolate'] = "isolate",
+        fallback_level_name: str = "NullHunter_Artifacts"
+    ) -> None:
         """
-        Initializes the Reconstructor.
+        Initializes the Advanced Reconstructor.
         
         Args:
-            strict_validation (bool): If True, raises errors when missing columns 
-                are detected. If False, gracefully skips them (useful for dynamic 
-                dropping during execution). Defaults to False.
+            strict_validation (bool): If True, raises errors when original columns 
+                are missing from the chunk. Defaults to False (graceful degradation).
+            unnamed_prefix (str): The exact prefix used by the Flattener to denote 
+                empty tuple levels. Must match Layer 1.5. Defaults to "UNNAMED_LEVEL".
+            unmapped_strategy (str): How to handle new columns added by the ML Engine 
+                (e.g., imputation flags). 'drop' deletes them. 'isolate' safely wraps 
+                them into a new MultiIndex hierarchy.
+            fallback_level_name (str): The root level name for isolated unmapped columns.
         """
         self.strict_validation = strict_validation
-        logger.debug(f"SchemaReconstructor initialized. Strict Mode: {self.strict_validation}")
+        self.unnamed_prefix = unnamed_prefix
+        self.unmapped_strategy = unmapped_strategy.lower()
+        self.fallback_level_name = fallback_level_name
+        
+        if self.unmapped_strategy not in ['drop', 'isolate']:
+            raise ValueError("Invalid unmapped_strategy. Must be 'drop' or 'isolate'.")
+            
+        logger.debug(
+            f"SchemaReconstructor Armed. Strict Mode: {self.strict_validation} | "
+            f"Unmapped Strategy: {self.unmapped_strategy.upper()}"
+        )
+
+
+    def _calculate_max_depth(self, columns: List[Any]) -> int:
+        """Calculates the maximum depth of a hierarchical column structure."""
+        depth = 1
+        for col in columns:
+            if isinstance(col, tuple):
+                depth = max(depth, len(col))
+        return depth
+
 
     def rebuild(
         self,
@@ -54,117 +93,133 @@ class SchemaReconstructor:
         master_ledger: Dict[str, Any],
         keep_optimized_headers: bool = False,
         inplace: bool = False,
-        drop_unmapped: bool = False,
         unnamed_fill_value: str = ""
     ) -> pd.DataFrame:
         """
         The Master Reconstruction Protocol.
         
         Applies reverse-mapping to restore MultiIndex columns and Row Indices in O(1) time.
+        Features dynamic tuple padding to prevent Pandas dimensional crashes.
         
         Args:
             chunk (pd.DataFrame): The processed, flat 2D dataframe chunk.
-            master_ledger (Dict[str, Any]): The reverse mapping dictionary generated by Pass-1.
-                Expected to contain an '__index_names__' key for row index mapping.
-            keep_optimized_headers (bool, optional): If True, retains the flat, clean headers 
+            master_ledger (Dict[str, Any]): The reverse mapping generated by Layer 1.5.
+                Expected to contain the '__index_names__' protocol key.
+            keep_optimized_headers (bool): If True, retains the flat, clean headers 
                 created by the optimizer, only restoring the row indices. Defaults to False.
-            inplace (bool, optional): If True, mutates the chunk in memory to save RAM. 
-                Defaults to False.
-            drop_unmapped (bool, optional): If True, deletes any newly generated temporary 
-                columns that do not exist in the master ledger. Defaults to False.
-            unnamed_fill_value (str, optional): The value used to replace 'UNNAMED_LEVEL' 
-                placeholders in MultiIndex levels. Defaults to an empty string "".
+            inplace (bool): If True, mutates the chunk in memory. Defaults to False.
+            unnamed_fill_value (str): The aesthetic value used to replace the 
+                `unnamed_prefix` in the final output (e.g., "").
                 
         Returns:
             pd.DataFrame: The structurally reconstructed dataframe ready for Disk I/O.
             
         Raises:
-            NullHunterReconstructionError: If structural integrity checks fail under strict mode.
+            NullHunterReconstructionError: If structural integrity checks fail.
         """
         start_time = time.perf_counter()
         
-        # 1. The O(1) Bypass (If data was already perfect or turbo mode is on)
+        # 1. The O(1) Highway Bypass
         if not master_ledger:
             return chunk if inplace else chunk.copy(deep=False)
 
-        # 2. Memory Management
+        # 2. RAM Constraint Management
         df = chunk if inplace else chunk.copy(deep=False)
 
-        # 3. Garbage Collection (Optional Temporary Column Cleanup)
-        if drop_unmapped:
-            mapped_keys = set(master_ledger.keys())
-            # We don't drop columns that were explicitly flagged as row indices
-            index_registry = master_ledger.get("__index_names__", [])
-            cols_to_drop = [
-                c for c in df.columns 
-                if c not in mapped_keys and c not in index_registry
-            ]
-            if cols_to_drop:
-                df.drop(columns=cols_to_drop, inplace=True)
-                logger.debug(f"Dropped {len(cols_to_drop)} unmapped temporary columns.")
-
-        # 4. Row Index Resurrection
-        # Extracts the secret '__index_names__' list stored by the Flattener
-        index_cols = master_ledger.get("__index_names__", [])
-        actual_index_cols = [col for col in index_cols if col in df.columns]
+        # 3. Artifact Extraction (Identifying newly generated AI columns)
+        mapped_keys = set(master_ledger.keys())
+        index_registry = master_ledger.get("__index_names__", [])
+        
+        unmapped_cols = [
+            c for c in df.columns 
+            if c not in mapped_keys and c not in index_registry
+        ]
+        
+        # 4. Row Index Resurrection (The Structural Anchor)
+        actual_index_cols = [col for col in index_registry if col in df.columns]
         
         if actual_index_cols:
             df.set_index(actual_index_cols, inplace=True)
             
-            # Restore the original beautiful names for the row indices
+            # Restore the original aesthetic names for the row indices
             restored_index_names = []
             for idx in actual_index_cols:
                 orig_mapping = master_ledger.get(idx, idx)
-                # If the original index name was a tuple, grab the most specific level
-                if isinstance(orig_mapping, tuple):
+                
+                # Check if it was purely positional in the original dataset
+                if isinstance(orig_mapping, str) and self.unnamed_prefix in orig_mapping:
+                    restored_index_names.append(None)
+                elif isinstance(orig_mapping, tuple):
+                    # For hierarchical rows, grab the most specific bottom level
                     restored_index_names.append(orig_mapping[-1])
                 else:
                     restored_index_names.append(orig_mapping)
             
             df.index.names = restored_index_names
 
-        # 5. Column Header Strategy (Consent-Driven)
+        # 5. Garbage Collection / Artifact Handling
+        if unmapped_cols:
+            if self.unmapped_strategy == 'drop':
+                df.drop(columns=unmapped_cols, inplace=True)
+                unmapped_cols = []
+                logger.debug(f"Garbage Collector: Dropped {len(unmapped_cols)} unmapped temp columns.")
+
+        # 6. Column Header Strategy (User Consent Bypass)
         if keep_optimized_headers:
-            # User wants to keep the clean ML-ready names. We exit early!
             return df
             
-        # 6. MultiIndex Header Restoration
+        # 7. MultiIndex Reconstruction & Translation
         new_columns = []
         is_hierarchical = False
         
         for col in df.columns:
-            # Fallback to current name if missing in ledger (graceful degradation)
+            if col in unmapped_cols:
+                # Retain as a flat string temporarily; will be padded later if needed
+                new_columns.append(col)
+                continue
+                
             original_shape = master_ledger.get(col, col)
             
             if self.strict_validation and col not in master_ledger:
                 raise NullHunterReconstructionError(
-                    f"Strict Mode Violation: Column '{col}' missing from Master Ledger."
+                    f"Strict Validation Failed: Column '{col}' missing from Master Ledger."
                 )
 
             if isinstance(original_shape, tuple):
                 is_hierarchical = True
-                # Clean up the ugly 'UNNAMED_LEVEL' placeholders
+                # Clean up the ugly Layer 1.5 placeholders
                 cleaned_tuple = tuple(
-                    unnamed_fill_value if "UNNAMED_LEVEL" in str(lvl) else lvl 
+                    unnamed_fill_value if self.unnamed_prefix in str(lvl) else lvl 
                     for lvl in original_shape
                 )
                 new_columns.append(cleaned_tuple)
             else:
                 new_columns.append(original_shape)
 
-        # 7. Apply the Final Shape
+        # 8. Dimensional Integrity (Tuple Padding)
         if is_hierarchical:
-            # Normalize mixed flat and tuple names into consistent tuples
-            normalized_cols = [
-                c if isinstance(c, tuple) else (c,) 
-                for c in new_columns
-            ]
+            max_depth = self._calculate_max_depth(new_columns)
+            normalized_cols = []
+            
+            for c in new_columns:
+                if isinstance(c, tuple):
+                    # Pad tuples that are shorter than the maximum hierarchy depth
+                    padding = (unnamed_fill_value,) * (max_depth - len(c))
+                    normalized_cols.append(c + padding)
+                else:
+                    # Isolate AI-generated unmapped columns safely into the 3D space
+                    if c in unmapped_cols:
+                        padding = (unnamed_fill_value,) * (max_depth - 2)
+                        normalized_cols.append((self.fallback_level_name, c) + padding)
+                    else:
+                        padding = (unnamed_fill_value,) * (max_depth - 1)
+                        normalized_cols.append((c,) + padding)
+                        
             df.columns = pd.MultiIndex.from_tuples(normalized_cols)
         else:
             df.columns = new_columns
 
         exec_time = (time.perf_counter() - start_time) * 1000
-        logger.debug(f"Chunk reconstructed in {exec_time:.2f} ms.")
+        logger.debug(f"Chunk structural integrity restored in {exec_time:.2f} ms.")
 
         return df
-    

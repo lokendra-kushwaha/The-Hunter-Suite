@@ -1,3 +1,19 @@
+"""
+NullHunter Data Ingestion Node (The RAM Architect)
+==================================================
+
+Enterprise-Grade CPU/RAM-Aware Data Ingestion Engine for Project NullHunter.
+Acts as the secure, autonomous entry point for datasets. It completely eliminates
+hardcoding by profiling real-time byte sizes, calculating optimal chunk sizes 
+for CPU cores, and generating dynamic memory buffers for the downstream Engine.
+
+Key Features:
+- Zero-OOM Streaming: Mathematically divides available RAM by active cores.
+- Autonomous Buffer Sizing: Calculates exact MB limits for Engine concatenation.
+- Mid-Stream Defense: Monitors RAM health dynamically during generation.
+- X-Ray Profiling: Detects delimiters, encoding, and row-weights automatically.
+"""
+
 import os
 import csv
 import gzip
@@ -25,6 +41,7 @@ class NullHunterSecurityError(Exception):
     """Raised when a potential path traversal or malicious file access is detected."""
     pass
 
+
 # ==========================================
 # LOGGER CONFIGURATION
 # ==========================================
@@ -35,27 +52,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
 # ==========================================
 # CLASS DATALOADER
 # ==========================================
 class DataLoader:
     """
-    Enterprise-Grade CPU-Aware Data Ingestion Engine for Project NullHunter.
-    
-    Acts as the secure, RAM-aware entry point for datasets. It calculates optimal 
-    chunk sizes by profiling real-time row byte sizes and mathematically dividing 
-    available RAM by the number of active CPU cores. Ensures zero-OOM crashes 
-    while maximizing Multiprocessing pipeline efficiency.
+    Intelligent Data Ingestion and Memory Orchestration Engine.
 
     Attributes:
         filepath (Path): Resolved, secure absolute path to the dataset.
-        chunk_size (Union[int, str]): Fixed row count, or 'auto' for dynamic CPU-aware sizing.
-        max_cores (int): Number of CPU cores downstream Engine will use for parallel processing.
-        ram_safety_margin (float): Percentage of free RAM to utilize safely (0.0 to 1.0).
-        memory_backend (str): Pandas backend ('pyarrow' recommended for zero-copy memory speed).
+        chunk_size (Union[int, str]): Row count per chunk, or 'auto' for dynamic scaling.
+        max_cores (int): Number of CPU cores downstream Engine will use.
+        ram_safety_margin (float): Percentage of free RAM utilized safely (0.1 to 0.9).
+        memory_backend (str): Underlying Pandas backend ('pyarrow' or 'numpy_nullable').
+        engine_buffer_limit_mb (int): Auto-calculated RAM limit for downstream concatenation.
     """
 
-    # Global mapping for identifying junk/null strings across SaaS datasets
     GLOBAL_NA_VALUES = [
         '?', 'N/A', 'n/a', 'NA', 'na', 'null', 'Null', 'NULL', 
         '#N/A', '#N/A N/A', '#DIV/0!', '#VALUE!', ' ', ''
@@ -64,7 +77,7 @@ class DataLoader:
     def __init__(
         self,
         filepath: Union[str, Path],
-        chunk_size: Union[int, Literal['auto']] = 'auto',
+        chunk_size: Optional[Union[int, Literal['auto']]] = None,
         max_cores: Optional[int] = None,
         ram_safety_margin: float = 0.50,
         fallback_encodings: Optional[List[str]] = None,
@@ -78,24 +91,24 @@ class DataLoader:
     ) -> None:
         """
         Initializes the DataLoader with advanced CPU/RAM synchronization constraints.
-        
+
         Args:
             filepath (Union[str, Path]): Path to the input dataset.
-            chunk_size (Union[int, Literal['auto']]): Fixed row size or 'auto' for intelligent scale.
+            chunk_size (Optional[Union[int, Literal['auto']]]): Fixed row size. If None or 'auto', scales dynamically.
             max_cores (Optional[int]): Target cores. Defaults to os.cpu_count() - 1.
             ram_safety_margin (float): Ratio of RAM permitted for ingestion (Default: 50%).
             fallback_encodings (Optional[List[str]]): Encodings to try if UTF-8 fails.
             possible_delimiters (Optional[List[str]]): Delimiters for the voting algorithm.
             fault_tolerance (str): Strategy for corrupted lines ('skip', 'error', 'warn').
-            memory_backend (str): Underlying datatype engine ('pyarrow' or 'numpy_nullable').
-            sniff_bytes (int): Buffer size for X-Ray profiling (Default: 16KB for precision).
+            memory_backend (str): Underlying datatype engine (e.g., 'pyarrow').
+            sniff_bytes (int): Buffer size for X-Ray profiling (Default: 16KB).
             detect_metadata_headers (bool): Auto-skips corporate title lines at file tops.
             standardize_nulls (bool): Maps dirty string nulls to pd.NA universally.
-            cache_in_memory (bool): If True, pins parsed chunks in RAM for instant multiple access.
+            cache_in_memory (bool): If True, pins parsed chunks in RAM for instant access.
         """
-        self.chunk_size = chunk_size
+        self.chunk_size = 'auto' if chunk_size is None else chunk_size
         self.max_cores = max_cores or max(1, (os.cpu_count() or 2) - 1)
-        self.ram_safety_margin = max(0.1, min(ram_safety_margin, 0.9)) # Clamp between 10% and 90%
+        self.ram_safety_margin = max(0.1, min(ram_safety_margin, 0.9)) 
         self.fault_tolerance = fault_tolerance
         self.memory_backend = memory_backend
         self.sniff_bytes = sniff_bytes
@@ -104,9 +117,11 @@ class DataLoader:
         self.cache_in_memory = cache_in_memory
 
         self._cached_chunks: List[pd.DataFrame] = []
+        self._cache_locked: bool = False
         self._fast_path: bool = False
         self.fast_path_threshold: float = 0.15 
-        self._estimated_bytes_per_row: int = 250 # Fallback estimate
+        self._estimated_bytes_per_row: int = 250 
+        self.engine_buffer_limit_mb: int = 0
         
         self.encodings = fallback_encodings or ['utf-8', 'latin-1', 'iso-8859-1', 'cp1252']
         self.delimiters = possible_delimiters or [',', ';', '\t', '|', '^']
@@ -120,7 +135,7 @@ class DataLoader:
             'na_values': self.GLOBAL_NA_VALUES if self.standardize_nulls else None
         }
         
-        # Phase 1: Security & File Identification
+        # Phase 1: Security & Setup
         self.filepath = self._secure_resolve_path(filepath)
         self._file_extension = self.filepath.suffix.lower()
         self._is_text_based = self._file_extension in ['.csv', '.tsv', '.txt']
@@ -128,32 +143,34 @@ class DataLoader:
         self._validate_file()
         self._detect_compression()
         
-        # Phase 2: Structural Profiling (X-Ray)
+        # Phase 2: Structural Profiling
         if self._is_text_based:
             self._sniff_and_configure_text()
             
-        # Phase 3: Mathematical CPU/RAM Scale Calculation
+        # Phase 3: Mathematical Scale Calculation
         self._evaluate_ram_and_scale()
 
     def _secure_resolve_path(self, raw_path: Union[str, Path]) -> Path:
         """Resolves path and mitigates directory traversal vulnerabilities."""
         try:
-            resolved_path = Path(raw_path).resolve(strict=True)
-            return resolved_path
+            resolved = Path(raw_path).resolve(strict=True)
+            if not resolved.is_file():
+                raise NullHunterFormatError(f"Path is not a valid file: {resolved}")
+            return resolved
         except FileNotFoundError:
             raise FileNotFoundError(f"[NullHunter] Dataset missing or inaccessible: {raw_path}")
         except Exception as e:
             raise NullHunterSecurityError(f"Path resolution failed (Security Risk): {str(e)}")
 
     def _validate_file(self) -> None:
-        """Verifies integrity and accessibility of the target file."""
+        """Verifies file integrity and access permissions."""
         if self.filepath.stat().st_size == 0:
             raise NullHunterFormatError("Cannot process a 0-byte empty dataset.")
         if not os.access(self.filepath, os.R_OK):
             raise PermissionError(f"System lacks read permissions for: {self.filepath.name}")
 
     def _detect_compression(self) -> None:
-        """Flags archive formats to ensure X-Ray sniffs raw data, not compressed binaries."""
+        """Flags archive formats to ensure X-Ray profiles raw data."""
         if self._file_extension == '.gz':
             self.safe_config['compression'] = 'gzip'
             self._is_text_based = True
@@ -191,17 +208,15 @@ class DataLoader:
         if self.detect_metadata_headers:
             self._detect_metadata_headers(decoded_sample)
             
-        # REAL-TIME ROW BYTE PROFILER: Calculate exactly how heavy one row is
         lines = decoded_sample.splitlines()
         if len(lines) > 2:
-            # Drop first and last line in case they are truncated or headers
             sample_lines = lines[1:-1] 
             total_bytes = sum(len(line.encode(self.safe_config['encoding'])) for line in sample_lines)
             self._estimated_bytes_per_row = total_bytes // len(sample_lines)
             logger.debug(f"Row Profiler: Estimated {self._estimated_bytes_per_row} bytes/row.")
 
     def _detect_encoding(self, raw_bytes: bytes) -> str:
-        """Cycles through fallbacks to decode text matrices safely."""
+        """Cycles through fallbacks to safely decode text matrices."""
         for enc in self.encodings:
             try:
                 decoded = raw_bytes.decode(enc)
@@ -213,7 +228,7 @@ class DataLoader:
         return raw_bytes.decode('unicode_escape')
 
     def _detect_delimiter(self, decoded_sample: str) -> None:
-        """Identifies matrix delimiters using Sniffer, falling back to a voting algorithm."""
+        """Identifies matrix delimiters using Sniffer and a fallback voting algorithm."""
         try:
             sniffer = csv.Sniffer()
             dialect = sniffer.sniff(decoded_sample, delimiters="".join(self.delimiters))
@@ -231,7 +246,7 @@ class DataLoader:
             self.safe_config['delimiter'] = best_delimiter if votes[best_delimiter] > 0 else ','
 
     def _detect_metadata_headers(self, decoded_sample: str) -> None:
-        """Detects unstructured corporate headers by tracking delimiter frequency mode."""
+        """Detects unstructured corporate headers by tracking delimiter frequency."""
         if not self.safe_config['delimiter']:
             return
         lines = decoded_sample.splitlines()
@@ -251,21 +266,18 @@ class DataLoader:
         self.safe_config['skiprows'] = skiprows
 
     def _evaluate_ram_and_scale(self) -> None:
-        """
-        The Mathematical Core: Synchronizes CPU Cores with Available RAM to calculate
-        the mathematically perfect chunk size for downstream execution.
-        """
+        """Synchronizes CPU Cores with Available RAM to calculate safe operational parameters."""
         file_size_bytes = self.filepath.stat().st_size
         available_ram_bytes = psutil.virtual_memory().available
         
-        # Memory bloat multiplier (Pandas dataframes take more RAM than raw text)
         multiplier = 6.0 if self._file_extension in ['.xlsx', '.xls'] else 3.5
         required_ram_bytes = file_size_bytes * multiplier
         
-        # 1. Bypass Logic (Fast Path) for small files
+        # 1. Bypass Logic (Fast Path)
         if required_ram_bytes < (available_ram_bytes * self.fast_path_threshold):
-            logger.info("Dataset is small relative to RAM. Activating FAST PATH (Disk I/O Bypass).")
+            logger.info("Dataset is small relative to RAM. Activating FAST PATH.")
             self._fast_path = True
+            self.engine_buffer_limit_mb = int((file_size_bytes * 2) / (1024 * 1024)) + 100 
             return
             
         self._fast_path = False
@@ -274,64 +286,87 @@ class DataLoader:
         if required_ram_bytes > (available_ram_bytes * 0.90):
             if self._file_extension in ['.xlsx', '.xls']:
                 raise NullHunterMemoryError(f"Fatal OOM Risk: Excel expansion requires {(required_ram_bytes/1e9):.1f}GB RAM.")
-            self.cache_in_memory = False # Force disable caching
+            self.cache_in_memory = False 
             
-        # 3. CPU-Aware Chunk Sizing Mathematics
+        # 3. Dynamic CPU-Aware Sizing
+        safe_ram_bytes = available_ram_bytes * self.ram_safety_margin
         if self.chunk_size == 'auto':
             if self._is_text_based:
-                # Calculate absolute safe RAM available for the ingestion batch
-                safe_ram_bytes = available_ram_bytes * self.ram_safety_margin
-                
-                # Distribute RAM equally among all active CPU cores
                 ram_per_core = safe_ram_bytes / self.max_cores
-                
-                # Calculate how many rows fit into a single core's RAM budget
                 bytes_per_row = self._estimated_bytes_per_row * multiplier
                 calculated_rows = int(ram_per_core / bytes_per_row)
-                
-                # Enforce architectural guardrails (Not too small, not too massive)
                 self.chunk_size = max(50000, min(calculated_rows, 2000000))
-                
                 logger.info(
                     f"Scale Matrix -> Cores: {self.max_cores} | "
                     f"Safe RAM/Core: {(ram_per_core/1e6):.0f}MB | "
                     f"Dynamic Chunk Size: {self.chunk_size} rows"
                 )
             else:
-                # Default safety size for binary formats (Parquet/JSON chunks)
                 self.chunk_size = 150000 
+                
+        # 4. Engine Buffer Calculation (The 15% RAM Rule)
+        self.engine_buffer_limit_mb = int((safe_ram_bytes * 0.30) / (1024 * 1024))
+        logger.info(f"Generated autonomous Engine Buffer Limit: {self.engine_buffer_limit_mb} MB")
+
+    def calculate_safe_buffer_limit(self) -> int:
+        """
+        Public API for the Supreme Commander (core.py) to extract the Engine's buffer limit.
+        
+        Returns:
+            int: Safe write buffer limit in Megabytes.
+        """
+        return max(50, self.engine_buffer_limit_mb)
+
+    def reset_stream(self) -> None:
+        """
+        Resets the internal state to allow iterating the dataset from the beginning.
+        Locks the cache to prevent redundant RAM utilization during Pass 2.
+        """
+        if self.cache_in_memory and self._cached_chunks:
+            logger.info("Stream reset requested. Operating from RAM Cache.")
+            self._cache_locked = True
         else:
-            logger.info(f"Using strict user-defined chunk size: {self.chunk_size} rows.")
+            logger.info("Stream reset requested. Re-initializing Disk I/O stream.")
 
     def get_chunks(self) -> Iterator[pd.DataFrame]:
         """
-        The Main Routing Gateway. Validates cache and dispatches to specific format streams.
+        The Main Routing Gateway. Yields safe, mathematically profiled DataFrame chunks.
         
         Yields:
             Iterator[pd.DataFrame]: Streamed DataFrame objects.
         """
         if self.cache_in_memory and self._cached_chunks:
-            logger.info("Serving data directly from Ultra-Fast RAM Cache.")
             yield from self._cached_chunks
             return
 
         try:
             if self._is_text_based:
-                yield from self._stream_csv()
+                stream = self._stream_csv()
             elif self._file_extension in ['.xlsx', '.xls']:
-                yield from self._stream_excel()
+                stream = self._stream_excel()
             elif self._file_extension == '.parquet':
-                yield from self._stream_parquet()
+                stream = self._stream_parquet()
             elif self._file_extension == '.json':
-                yield from self._stream_json()
+                stream = self._stream_json()
             else:
-                raise NullHunterFormatError(f"Unsupported binary structure: {self._file_extension}")
+                raise NullHunterFormatError(f"Unsupported format: {self._file_extension}")
+                
+            for chunk in stream:
+                # Mid-stream OOM Defense
+                if psutil.virtual_memory().percent > 95.0:
+                    logger.warning("CRITICAL: System RAM exceeding 95%. Flushing cache to prevent OS crash.")
+                    self._cached_chunks.clear()
+                    self.cache_in_memory = False
+                    
+                if self.cache_in_memory and not self._cache_locked:
+                    self._cached_chunks.append(chunk)
+                yield chunk
+                
         except Exception as e:
             logger.error(f"Ingestion stream collapsed: {str(e)}")
             raise
 
     def _stream_csv(self) -> Iterator[pd.DataFrame]:
-        """Iterates CSV matrices using high-performance PyArrow engine mapping."""
         engine = 'pyarrow' if self.memory_backend == 'pyarrow' else self.safe_config['engine']
         read_kwargs = {
             'filepath_or_buffer': self.filepath,
@@ -347,64 +382,33 @@ class DataLoader:
         }
 
         if self._fast_path:
-            df = pd.read_csv(**read_kwargs)
-            if self.cache_in_memory:
-                self._cached_chunks.append(df)
-            yield df
+            yield pd.read_csv(**read_kwargs)
         else:
             read_kwargs['chunksize'] = self.chunk_size
-            for chunk in pd.read_csv(**read_kwargs):
-                if self.cache_in_memory:
-                    self._cached_chunks.append(chunk)
-                yield chunk
+            yield from pd.read_csv(**read_kwargs)
 
     def _stream_excel(self) -> Iterator[pd.DataFrame]:
-        """Monolithic bypass for Excel sheets (uncapable of partial extraction)."""
-        df = pd.read_excel(self.filepath, dtype_backend=self.memory_backend, na_values=self.safe_config['na_values'])
-        if self.cache_in_memory:
-            self._cached_chunks.append(df)
-        yield df
+        yield pd.read_excel(self.filepath, dtype_backend=self.memory_backend, na_values=self.safe_config['na_values'])
 
     def _stream_parquet(self) -> Iterator[pd.DataFrame]:
-        """True Parquet Chunking: Yields native Row Groups to prevent RAM detonation."""
         if self._fast_path:
-            df = pd.read_parquet(self.filepath, dtype_backend=self.memory_backend)
-            if self.cache_in_memory:
-                self._cached_chunks.append(df)
-            yield df
+            yield pd.read_parquet(self.filepath, dtype_backend=self.memory_backend)
         else:
             parquet_file = pq.ParquetFile(self.filepath)
             batch_size = self.chunk_size if isinstance(self.chunk_size, int) else 150000
             for batch in parquet_file.iter_batches(batch_size=batch_size):
-                df = batch.to_pandas(types_mapper=pd.ArrowDtype if self.memory_backend == 'pyarrow' else None)
-                if self.cache_in_memory:
-                    self._cached_chunks.append(df)
-                yield df
+                yield batch.to_pandas(types_mapper=pd.ArrowDtype if self.memory_backend == 'pyarrow' else None)
 
     def _stream_json(self) -> Iterator[pd.DataFrame]:
-        """Handles streaming nested/linear JSON matrices."""
         if self._fast_path:
-            df = pd.read_json(self.filepath, dtype_backend=self.memory_backend)
-            if self.cache_in_memory:
-                self._cached_chunks.append(df)
-            yield df
+            yield pd.read_json(self.filepath, dtype_backend=self.memory_backend)
         else:
             try:
                 c_size = int(self.chunk_size) if isinstance(self.chunk_size, int) else 100000
-                chunk_iterator = pd.read_json(
-                    self.filepath, 
-                    orient='records', 
-                    lines=True, 
-                    chunksize=c_size,
-                    dtype_backend=self.memory_backend
+                yield from pd.read_json(
+                    self.filepath, orient='records', lines=True, 
+                    chunksize=c_size, dtype_backend=self.memory_backend
                 )
-                for chunk in chunk_iterator:
-                    if self.cache_in_memory:
-                        self._cached_chunks.append(chunk)
-                    yield chunk
             except Exception:
-                logger.warning("JSON streaming failed (Likely deeply nested). Initiating monolithic fallback.")
-                df = pd.read_json(self.filepath, dtype_backend=self.memory_backend)
-                if self.cache_in_memory:
-                    self._cached_chunks.append(df)
-                yield df
+                logger.warning("JSON streaming failed. Initiating monolithic fallback.")
+                yield pd.read_json(self.filepath, dtype_backend=self.memory_backend)
