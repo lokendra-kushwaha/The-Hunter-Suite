@@ -1,18 +1,19 @@
 """
-NullHunter Execution Engine
-=================================================
+NullHunter Execution Engine (The Pipeline Orchestrator)
+===================================================================
 
 This module acts as the isolated Pass-2 Execution Pipeline for the NullHunter framework.
 It operates purely on the "Delegation Pattern", receiving planning assets (Blueprint, 
-Master Ledger) from the core.py and executing them using the 
+Master Ledger) from the API Gateway and orchestrating the massive data flow utilizing 
 UniversalParallelRunner.
 
 Key Architectural Pillars:
-1. Dynamic Dispatch (Registry Pattern): Eliminates if-else spaghetti logic.
-2. Dumb Core Routing: Defers RAM management entirely to the Loader. It only maps 
-   batches strictly to the available CPU count to prevent OS UI freezing.
-3. Fault Tolerance & Atomic I/O: Implements exponential backoff for disk writes.
-4. Granular Telemetry: Tracks microsecond-level execution times per transformation.
+1. Dynamic RAM Buffering (Smart Concatenation): Eliminates Disk I/O bottlenecks by 
+   accumulating reconstructed chunks in RAM up to a safe limit before monolithic writes.
+2. Multi-Format Atomic I/O: Supports CSV, Parquet, and JSON chunked writing natively.
+3. Pre-Execution Blueprint Validation: Statically verifies tool existence before pipeline start.
+4. Adaptive Memory Shield: Monitors OS memory limits and forces aggressive garbage collection.
+5. Dynamic Dispatch (Registry Pattern): Eliminates conditional spaghetti logic via UDFs.
 """
 
 import os
@@ -21,6 +22,8 @@ import time
 import signal
 import logging
 import itertools
+import traceback
+import psutil
 import pandas as pd
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -57,7 +60,7 @@ class NullHunterDiskIOError(Exception):
 
 
 # ==========================================
-# DATA STRUCTURES
+# TELEMETRY DATA STRUCTURES
 # ==========================================
 @dataclass
 class ChunkTelemetry:
@@ -71,17 +74,18 @@ class ChunkTelemetry:
     memory_saved_mb: float = 0.0
     error_flag: bool = False
     error_msg: str = ""
+    traceback_log: Optional[str] = None
 
 
 # ==========================================
-# TOOL REGISTRY
+# TOOL REGISTRY (The Algorithm Box)
 # ==========================================
 class _ToolRegistry:
     """
     A robust registry for maintaining analytical tools.
     Provides isolation, validation, and dynamic dispatching capabilities.
     """
-    def __init__(self):
+    def __init__(self) -> None:
         self._tools: Dict[str, Callable] = {}
 
     def register(self, name: str) -> Callable:
@@ -115,14 +119,6 @@ class _ToolRegistry:
 registry = _ToolRegistry()
 
 
-# --- Dummy Implementations for Registry (To be moved to nullhunter.tools later) ---
-@registry.register("drop_column")
-def _tool_drop_column(chunk: pd.DataFrame, col: str, **kwargs) -> pd.DataFrame:
-    if col in chunk.columns:
-        return chunk.drop(columns=[col])
-    return chunk
-
-
 # ==========================================
 # THE ISOLATED CPU WORKER (UDF for Runner)
 # ==========================================
@@ -137,8 +133,7 @@ def _apply_blueprint_to_chunk(
     based on the AI blueprint and records granular execution metrics.
     
     Note on Execution Order: Memory Optimization (type casting) is strictly executed 
-    AFTER all mathematical operations (imputation/capping) to prevent precision loss 
-    or TypeErrors during execution.
+    AFTER all mathematical operations to prevent precision loss or TypeErrors.
     
     Args:
         chunk (pd.DataFrame): The flattened 2D DataFrame chunk.
@@ -168,11 +163,12 @@ def _apply_blueprint_to_chunk(
         pipeline = instructions.get("cleaning_pipeline", [])
         mem_opt = instructions.get("memory_optimization", None)
         
-        # 1. Smart Lazy Evaluation
+        # Smart Lazy Evaluation
         has_nulls = processed_chunk[col].isnull().any()
         
-        # 2. Execute Mathematical Pipeline (Dynamic Dispatch)
+        # 1. Execute Mathematical Pipeline (Dynamic Dispatch)
         for tool_name in pipeline:
+            # Skip imputation algorithms if the column has zero nulls in this specific chunk
             if "imputer" in tool_name and not has_nulls:
                 continue
                 
@@ -188,12 +184,14 @@ def _apply_blueprint_to_chunk(
             except Exception as e:
                 metrics.error_flag = True
                 metrics.error_msg = f"Tool '{tool_name}' failed on '{col}': {str(e)}"
+                metrics.traceback_log = traceback.format_exc()
                 raise RuntimeError(metrics.error_msg)
                 
+            # If a tool (like drop_column) removed the column, break the inner loop
             if col not in processed_chunk.columns:
                 break
                 
-        # 3. Execute Memory Optimization (Strictly separate and executed last)
+        # 2. Execute Memory Optimization (Strictly separate and executed last)
         if mem_opt and col in processed_chunk.columns:
             caster = registry.get_tool("type_caster")
             if caster:
@@ -214,19 +212,20 @@ def _apply_blueprint_to_chunk(
 
 
 # ==========================================
-# THE Execution Engine
+# THE EXECUTION ENGINE (Orchestrator)
 # ==========================================
 class ExecutionEngine:
     """
-    The Execution Pipeline Worker.
+    The Execution Pipeline Orchestrator.
     
     Operates strictly in Pass-2. Takes the pre-calculated Blueprint and Master Ledger 
-    from the core.py and orchestrates the massive data flow.
+    from the Gateway and orchestrates the massive data flow utilizing Smart Write Buffering.
     
     Responsibilities:
-    - Maintains OS stability by reserving exactly 1 CPU core.
-    - Streams data efficiently using `itertools.islice`.
-    - Handles exponential backoff for disk I/O to prevent file locking crashes.
+    - Maintains OS stability by reserving CPU cores.
+    - Manages Dynamic RAM Buffering to eliminate Disk I/O bottlenecks.
+    - Pre-validates AI blueprints against the Tool Registry.
+    - Handles exponential backoff for multi-format disk writes (CSV/Parquet).
     """
     
     def __init__(
@@ -234,38 +233,58 @@ class ExecutionEngine:
         loader_ref: Any, 
         reconstructor_ref: Any,
         parallel_runner_ref: UniversalParallelRunner,
-        max_cores: Optional[int] = None
+        write_buffer_limit_mb: int = 50,
+        max_cores: Optional[int] = None,
+        io_retries: int = 4,
+        io_backoff_factor: float = 1.5,
+        memory_shield_threshold: float = 90.0
     ) -> None:
         """
-        Initializes the Engine with external dependencies.
+        Initializes the Engine with external dependencies and robust architectural limits.
         
         Args:
             loader_ref (Any): Reference to the instantiated DataLoader.
             reconstructor_ref (Any): Reference to the instantiated Reconstructor.
             parallel_runner_ref (UniversalParallelRunner): The God-Mode executor.
-            max_cores (Optional[int]): Hard limit for cores. Defaults to N-1.
+            write_buffer_limit_mb (int): Max RAM allocated for chunk concatenation.
+            max_cores (Optional[int]): Hard limit for cores. Defaults to OS Cores - 1.
+            io_retries (int): Maximum retry attempts for disk writes.
+            io_backoff_factor (float): Multiplier for exponential sleep during disk lock.
+            memory_shield_threshold (float): % of system RAM usage triggering aggressive GC.
         """
         self.loader = loader_ref
         self.reconstructor = reconstructor_ref
         self.runner = parallel_runner_ref
         
+        # Enforce minimum buffer size to prevent useless micro-writes
+        self.write_buffer_limit_mb = max(10, write_buffer_limit_mb)
+        
         self.system_cores = os.cpu_count() or 4
-        # N-1 Logic: Prevents OS freezing by keeping 1 core free.
         self.max_cores = max_cores if max_cores else max(1, self.system_cores - 1)
         
+        self.io_retries = max(1, io_retries)
+        self.io_backoff_factor = max(1.1, io_backoff_factor)
+        self.memory_shield_threshold = memory_shield_threshold
+        
         self._shutdown_flag = False
+        self._write_buffer: List[pd.DataFrame] = []
+        self._current_buffer_weight_mb: float = 0.0
+        self._is_first_write = True
+        
         self._register_signals()
         
-        logger.info(f"ExecutionEngine Armed. Target Capacity: {self.max_cores} parallel streams.")
-
+        logger.info(
+            f"ExecutionEngine Armed | Core Limit: {self.max_cores} | "
+            f"Buffer Limit: {self.write_buffer_limit_mb}MB | I/O Retries: {self.io_retries}"
+        )
 
     def _register_signals(self) -> None:
-        """Registers OS signals to allow graceful shutdown without corrupting the CSV."""
+        """Registers OS signals to allow graceful shutdown without corrupting the Output file."""
         try:
             signal.signal(signal.SIGINT, self._handle_shutdown)
             signal.signal(signal.SIGTERM, self._handle_shutdown)
         except ValueError:
-            # Occurs if not running in the main thread; safe to ignore.
+            # Safe to ignore if running in a child thread
             pass
 
     def _handle_shutdown(self, signum: int, frame: Any) -> None:
@@ -273,35 +292,99 @@ class ExecutionEngine:
         logger.warning("\n[ALERT] Termination signal received. Halting pipeline gracefully...")
         self._shutdown_flag = True
 
-
-    def _safe_disk_write(self, df: pd.DataFrame, path: Path, is_first: bool) -> None:
+    def _verify_blueprint_integrity(self, blueprint: Dict[str, Dict[str, Any]]) -> None:
         """
-        Writes dataframe to disk with an Exponential Backoff Retry mechanism.
-        Protects against temporary OS-level file locks.
+        Pre-Execution Static Validation.
+        Scans the entire blueprint to ensure all requested tools exist in the registry.
+        Prevents the pipeline from crashing mid-execution after hours of processing.
+        """
+        logger.debug("Running Static Validation on AI Blueprint...")
+        missing_tools = set()
+        
+        for col, instructions in blueprint.items():
+            pipeline = instructions.get("cleaning_pipeline", [])
+            for tool in pipeline:
+                if not registry.get_tool(tool):
+                    missing_tools.add(tool)
+                    
+        if missing_tools:
+            raise NullHunterNotImplementedError(
+                f"Blueprint Integrity Check Failed! The following AI tools were requested "
+                f"by the Scanner but are missing from the Engine Registry: {list(missing_tools)}"
+            )
+        logger.info("Blueprint Integrity Verified. All required tools are active.")
+
+
+    def _safe_disk_io_writer(self, df: pd.DataFrame, path: Path, is_first: bool) -> None:
+        """
+        The Abstracted Multi-Format Atomic Writer.
+        Writes DataFrames to disk with an Exponential Backoff Retry mechanism.
+        Automatically detects file extensions (.csv, .parquet, .json).
         
         Args:
-            df (pd.DataFrame): The final reconstructed chunk.
+            df (pd.DataFrame): The final chunk or concatenated buffer to write.
             path (Path): Destination file path.
             is_first (bool): Determines if headers should be written and file overwritten.
             
         Raises:
             NullHunterDiskIOError: If all retries fail.
         """
-        max_retries = 3
+        file_ext = path.suffix.lower()
         write_mode = 'w' if is_first else 'a'
         write_header = is_first
-        
-        for attempt in range(max_retries):
+
+        for attempt in range(self.io_retries):
             try:
-                df.to_csv(path, mode=write_mode, index=False, header=write_header)
-                return  # Success
-            except PermissionError as e:
-                logger.warning(f"Disk locked by OS. Retry {attempt + 1}/{max_retries}...")
-                time.sleep(1.5 ** attempt) # Exponential backoff: 1s, 1.5s, 2.25s
-            except Exception as e:
-                raise NullHunterDiskIOError(f"Unexpected I/O failure: {str(e)}")
+                if file_ext == '.parquet':
+                    # Parquet requires engine-specific appending logic
+                    if is_first:
+                        df.to_parquet(path, engine='pyarrow', index=False)
+                    else:
+                        import pyarrow as pa
+                        import pyarrow.parquet as pq
+                        table = pa.Table.from_pandas(df, preserve_index=False)
+                        with pq.ParquetWriter(path, table.schema) as writer:
+                            writer.write_table(table)
+                elif file_ext == '.json':
+                    df.to_json(path, orient='records', lines=True, mode=write_mode)
+                else:
+                    # Default CSV writer
+                    df.to_csv(path, mode=write_mode, index=False, header=write_header)
+                    
+                return  # Atomic Write Successful
                 
-        raise NullHunterDiskIOError(f"Failed to write to '{path}' after {max_retries} attempts.")
+            except (PermissionError, OSError) as e:
+                logger.warning(f"Disk locked/busy. Retry {attempt + 1}/{self.io_retries} due to: {str(e)}")
+                time.sleep(self.io_backoff_factor ** attempt)
+            except Exception as e:
+                raise NullHunterDiskIOError(f"Critical I/O serialization failure: {str(e)}")
+                
+        raise NullHunterDiskIOError(f"Failed to flush RAM to '{path}' after {self.io_retries} attempts.")
+
+
+    def _flush_buffer_to_disk(self, output_file: Path) -> None:
+        """
+        Concatenates all reconstructed chunks residing in the RAM Buffer and 
+        flushes them to disk using the generalized safe I/O writer.
+        """
+        if not self._write_buffer:
+            return
+            
+        logger.info(f"Flushing {self._current_buffer_weight_mb:.1f}MB Concatenated RAM Buffer to disk...")
+        
+        try:
+            # Smart RAM Concatenation (High Speed, Single Allocation)
+            merged_df = pd.concat(self._write_buffer, ignore_index=True)
+        except Exception as e:
+            raise NullHunterEngineError(f"RAM Buffer Concatenation failed: {str(e)}")
+            
+        # Delegate to the standalone Atomic Writer
+        self._safe_disk_io_writer(df=merged_df, path=output_file, is_first=self._is_first_write)
+        
+        # Update State Flags & Free Memory
+        self._is_first_write = False
+        self._write_buffer.clear()
+        self._current_buffer_weight_mb = 0.0
 
 
     def execute_pipeline(
@@ -309,18 +392,20 @@ class ExecutionEngine:
         destination: Union[str, Path],
         master_ledger: Dict[str, Any],
         blueprint: Dict[str, Dict[str, Any]],
+        keep_optimized_headers: bool = False,
         fail_fast: bool = False
     ) -> Dict[str, Any]:
         """
-        The Master Execution Loop.
+        The Master Execution Loop (Pass 2).
         
-        Streams batches sequentially from the Loader matching the core capacity, 
-        processes them in parallel, and flushes to disk.
+        Streams batches from the Loader, processes them via Runner, reconstructs their 
+        original shapes, and utilizes the Smart Buffer to eliminate Disk I/O bottlenecks.
         
         Args:
-            destination (Union[str, Path]): Where the final cleaned CSV should be saved.
-            master_ledger (Dict[str, Any]): Mapping for the reconstructor. Empty if bypassed.
-            blueprint (Dict[str, Dict[str, Any]]): Execution instructions for the tools.
+            destination (Union[str, Path]): Where the final cleaned data should be saved.
+            master_ledger (Dict[str, Any]): Mapping for the reconstructor.
+            blueprint (Dict[str, Dict[str, Any]]): AI execution instructions.
+            keep_optimized_headers (bool): Preserve ML-ready names during reconstruction.
             fail_fast (bool): If True, aborts the pipeline upon a single chunk failure.
             
         Returns:
@@ -329,33 +414,35 @@ class ExecutionEngine:
         start_time = time.perf_counter()
         output_file = Path(destination)
         
+        # Validate blueprint BEFORE starting execution
+        self._verify_blueprint_integrity(blueprint)
+        
         telemetry = {
             "status": "in_progress",
             "total_chunks_processed": 0,
             "total_chunks_failed": 0,
             "total_memory_saved_mb": 0.0,
+            "buffer_flushes_executed": 0,
             "failure_logs": [],
             "execution_time_sec": 0.0,
             "destination_path": str(output_file)
         }
         
-        logger.info(f"Initiating Pass-2 Execution Pipeline. Output: {output_file}")
-        
-        # Engine is "dumb" to RAM. It only pulls what it can compute simultaneously.
+        logger.info(f"Initiating Pass-2 Execution Pipeline. Output target: {output_file}")
         chunk_generator: Generator = self.loader.get_chunks()
-        is_first_write = True
         
         while not self._shutdown_flag:
-            # 1. Pull exact batch size using itertools (Clean & Pythonic)
+            # 1. Adaptive Memory Shield
+            if psutil.virtual_memory().percent > self.memory_shield_threshold:
+                logger.warning(f"Memory Shield Activated (RAM > {self.memory_shield_threshold}%). Forcing GC.")
+                gc.collect()
+
+            # 2. Pull Batch strictly limited by available Cores
             batch_chunks = list(itertools.islice(chunk_generator, self.max_cores))
-            
             if not batch_chunks:
-                break # Stream completely exhausted
+                break 
                 
-            logger.info(f"Dispatching batch of {len(batch_chunks)} chunks to Runner...")
-            
-            # 2. Execute via God-Mode Runner
-            # The Runner returns a list of tuples: [(df, metrics), (df, metrics), ...]
+            # 3. Parallel Processing via Runner
             runner_results, run_report = self.runner.execute(
                 func=_apply_blueprint_to_chunk,
                 payload=batch_chunks,
@@ -370,31 +457,45 @@ class ExecutionEngine:
                     telemetry["status"] = "aborted"
                     break
 
-            # 3. Process Success Returns & Safe Disk Flush
+            # 4. Shape Reconstruction & Buffer Routing
             for result_tuple in runner_results:
                 if not isinstance(result_tuple, tuple) or len(result_tuple) != 2:
                     continue
                     
                 clean_chunk, chunk_metrics = result_tuple
-                
-                # Aggregate micro-metrics
                 telemetry["total_chunks_processed"] += 1
                 telemetry["total_memory_saved_mb"] += getattr(chunk_metrics, 'memory_saved_mb', 0.0)
                 
-                # O(1) Reconstruction
+                # Reconstruct Shape (Layer 3.0)
                 if master_ledger:
-                    final_chunk = self.reconstructor.rebuild(clean_chunk, master_ledger)
+                    final_chunk = self.reconstructor.rebuild(
+                        chunk=clean_chunk, 
+                        master_ledger=master_ledger,
+                        keep_optimized_headers=keep_optimized_headers,
+                        inplace=True 
+                    )
                 else:
                     final_chunk = clean_chunk
                     
-                # Atomic Write
-                self._safe_disk_write(final_chunk, output_file, is_first_write)
-                is_first_write = False
-            
-            # 4. Aggressive Memory Sweeping (GC)
+                # Calculate chunk weight and route to Smart Buffer
+                chunk_weight = final_chunk.memory_usage(deep=True).sum() / (1024 ** 2)
+                self._write_buffer.append(final_chunk)
+                self._current_buffer_weight_mb += chunk_weight
+                
+                # Check Flush Threshold
+                if self._current_buffer_weight_mb >= self.write_buffer_limit_mb:
+                    self._flush_buffer_to_disk(output_file)
+                    telemetry["buffer_flushes_executed"] += 1
+
+            # 5. Aggressive Memory Sweeping (GC)
             del batch_chunks
             del runner_results
             gc.collect()
+            
+        # 6. Residual Flush (Drain the remaining buffer)
+        if self._write_buffer and telemetry["status"] != "aborted":
+            self._flush_buffer_to_disk(output_file)
+            telemetry["buffer_flushes_executed"] += 1
             
         if self._shutdown_flag:
             telemetry["status"] = "interrupted_by_user"
@@ -407,9 +508,8 @@ class ExecutionEngine:
         logger.info(
             f"Pipeline Completed [{telemetry['status']}] in {telemetry['execution_time_sec']}s. "
             f"Processed: {telemetry['total_chunks_processed']} | "
-            f"Failed: {telemetry['total_chunks_failed']} | "
-            f"RAM Saved: {telemetry['total_memory_saved_mb']} MB"
+            f"RAM Saved: {telemetry['total_memory_saved_mb']} MB | "
+            f"Disk Writes (Flushes): {telemetry['buffer_flushes_executed']}"
         )
                     
-        return telemetry
-    
+        return telemetry  
